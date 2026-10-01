@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-Use GitHub's **Security → Advisories → Report a vulnerability** for a private report when that feature is enabled. Include the affected version or commit, a sanitized reproduction, impact, and any suggested fix. If private reporting is unavailable, ask the maintainer for a private contact through an issue without publishing exploit details or credentials.
+Use GitHub's [Report a vulnerability](https://github.com/maks-emelyanov/sweepflow/security/advisories/new) to submit a private report. Include the affected version or commit, a sanitized reproduction, impact, and any suggested fix. Do not publish exploit details or credentials in a public issue.
 
 This is an alpha project. Reports against the current development version are welcome; no response-time or supported-release guarantee is provided.
 

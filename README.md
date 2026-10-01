@@ -17,9 +17,11 @@ SweepFlow is a Python workflow for researching and paper trading a **prior-day l
 
 ## Quick start
 
-Use Python **3.14 or newer** and [uv](https://docs.astral.sh/uv/getting-started/installation/). Run these commands from the repository root:
+Use Python **3.14 or newer** and [uv](https://docs.astral.sh/uv/getting-started/installation/). Clone the repository and install the core and development dependencies:
 
 ```bash
+git clone https://github.com/maks-emelyanov/sweepflow.git
+cd sweepflow
 uv sync --locked --group dev
 uv run --no-sync sweepflow --help
 

@@ -14,6 +14,8 @@ The core and most tests work without broker accounts, credentials, or sibling re
 
 Before submitting a pull request, describe the behavior that changes and the checks you ran. Add focused regression coverage for changes to strategy rules, data validation, risk sizing, execution, persistence, or restart behavior. Use synthetic fixtures or sanitized reproductions. Keep the documentation and command examples consistent with the CLI.
 
+Pull requests from external contributors require a maintainer to approve GitHub Actions before CI runs.
+
 Strategy changes must preserve causal candle ordering, timezone-aware timestamps, decimal price/risk arithmetic, and complete prior-session validation. Execution changes must retain paper-only endpoints, durable order identity, reconciliation after ambiguous submissions, and ownership checks before canceling or closing exposure. Existing `liquidity:` UUID seeds and `liq-` client order prefixes are persisted compatibility identifiers.
 
 When dependencies change, regenerate `uv.lock` with `uv lock` and verify `uv sync --locked`. Core package metadata must not depend on a developer's local filesystem. The dashboard and Robinhood wrapper remain separately installed integrations until a deliberate distribution strategy is adopted.
