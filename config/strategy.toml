@@ -1,0 +1,36 @@
+# Current State Street SPY equity holdings; alternatives: "etfs" or "custom".
+# An explicit symbols array or CLI --symbols-file overrides the automatic universe.
+universe = "sp500"
+symbols = []
+
+[strategy]
+pivot_left = 2
+pivot_right = 2
+max_bars_sweep_to_bos = 3
+entry_mode = "first_touch" # first_touch, midpoint, deep_edge
+minimum_rr = "2.5"
+tick_size = "0.01"
+stop_buffer_ticks = 1
+max_setups_per_symbol_per_session = 1
+
+# Offsets from the exchange open / before the exchange close, respectively.
+# Default: 09:30–10:30 and 15:00–15:55 America/New_York.
+# On a 13:00 early close, the closing window becomes 12:00–12:55.
+opening_start_minutes = 0
+opening_end_minutes = 60
+closing_start_minutes = 60
+closing_end_minutes = 5
+
+[risk]
+# Offline replay starting equity. Alpaca paper sizing uses the actual account equity.
+account_equity = "100000"
+risk_per_trade = "0.0025"
+max_daily_loss = "0.01"
+max_concurrent_positions = 4
+max_symbol_notional = "0.20"
+max_total_notional = "0.80"
+
+[execution]
+# Shorts are available in replay and Alpaca paper (subject to account/asset eligibility).
+# Bearish signals are always detected by the strategy engine.
+allow_shorts = false

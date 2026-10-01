@@ -1,0 +1,21 @@
+[Unit]
+Description=SweepFlow strategy - Alpaca paper trading session
+# Render this template with ops/render_systemd.py before installing it.
+Documentation=file:@SWEEPFLOW_ROOT@/README.md
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=@SWEEPFLOW_ROOT@
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+ExecCondition="@SWEEPFLOW_ROOT@/.venv/bin/python" -u -m sweepflow.scheduled --check
+ExecStart="@SWEEPFLOW_ROOT@/.venv/bin/python" -u -m sweepflow.scheduled --config config/strategy.toml --env-file .env --db data/alpaca-paper.sqlite --allow-shorts
+Restart=on-failure
+RestartSec=30s
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=180s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sweepflow-paper

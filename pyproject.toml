@@ -1,0 +1,69 @@
+[project]
+name = "sweepflow"
+version = "0.1.0"
+description = "SweepFlow: session-aware S&P 500 liquidity sweep, BOS, and FVG strategy"
+readme = "README.md"
+requires-python = ">=3.14"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Maks Emelyanov" }]
+keywords = ["trading", "paper-trading", "backtesting", "liquidity", "alpaca"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+dependencies = [
+    "exchange-calendars>=4.12,<5",
+]
+
+[project.urls]
+Homepage = "https://github.com/maks-emelyanov/sweepflow"
+Repository = "https://github.com/maks-emelyanov/sweepflow"
+Documentation = "https://github.com/maks-emelyanov/sweepflow/tree/main/docs"
+Issues = "https://github.com/maks-emelyanov/sweepflow/issues"
+"Security Policy" = "https://github.com/maks-emelyanov/sweepflow/security/policy"
+
+[project.scripts]
+sweepflow = "sweepflow.cli:main"
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["sweepflow"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/sweepflow",
+    "/tests",
+    "/config",
+    "/examples",
+    "/docs",
+    "/ops",
+    "/.env.example",
+    "/.python-version",
+    "/README.md",
+    "/CONTRIBUTING.md",
+    "/SECURITY.md",
+    "/LICENSE",
+    "/pyproject.toml",
+    "/uv.lock",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.3,<10", "ruff>=0.11,<1"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-config --strict-markers"
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

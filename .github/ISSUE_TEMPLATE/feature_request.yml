@@ -1,0 +1,34 @@
+name: Feature request
+description: Propose a concrete improvement to SweepFlow.
+title: "[Feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Keep examples synthetic or sanitized. Do not include credentials, account IDs, balances, raw broker responses, or account journals. Use the [security policy](https://github.com/maks-emelyanov/sweepflow/security/policy) for vulnerabilities.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: Describe the task you want to accomplish and the current limitation. Identify the affected command or workflow.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Explain the desired behavior, with an example command, configuration, or synthetic candle scenario where useful.
+    validations:
+      required: true
+  - type: textarea
+    id: validation
+    attributes:
+      label: Acceptance criteria
+      description: Describe observable results that would show the feature works. For strategy or execution changes, suggest a synthetic scenario and expected signals, orders, fills, or journal records.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Alternatives and environment
+      description: Include alternatives or workarounds you considered. If relevant, specify your operating system, Python version, and optional integrations.

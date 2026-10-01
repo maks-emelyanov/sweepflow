@@ -1,0 +1,18 @@
+[Unit]
+Description=Start and recover SweepFlow paper sessions (America/New_York)
+
+[Timer]
+# Retry startup each minute during the regular-session window. While the service
+# is running systemd does not create another instance. Python gates holidays and
+# early closes, with 30 minutes before open and 10 minutes after close.
+OnCalendar=Mon..Fri *-*-* 09:00..59:00 America/New_York
+OnCalendar=Mon..Fri *-*-* 10..15:*:00 America/New_York
+OnCalendar=Mon..Fri *-*-* 16:00..10:00 America/New_York
+OnStartupSec=1min
+Persistent=true
+AccuracySec=1s
+RandomizedDelaySec=0
+Unit=sweepflow-paper.service
+
+[Install]
+WantedBy=timers.target

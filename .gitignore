@@ -1,0 +1,49 @@
+# Python environments and generated files
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Tool caches and coverage reports
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Local credentials and environment overrides; keep the public template
+.env
+.env.*
+*.env
+*.env.*
+!.env.example
+.aws/
+*credentials*.json
+*.pem
+*.key
+
+# Runtime data, account journals, and logs
+/data/
+*.sqlite*
+*.db
+*.db-*
+*.log
+
+# Local agent/editor state and OS files
+.agents/
+.codex/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

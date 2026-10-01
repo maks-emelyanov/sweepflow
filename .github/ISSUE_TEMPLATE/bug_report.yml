@@ -1,0 +1,45 @@
+name: Bug report
+description: Report unexpected behavior with a reproducible example.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use synthetic candles or sanitized examples. Do not include API keys, OAuth tokens, account IDs, balances, raw broker responses, or account journals. Report vulnerabilities privately through the [security policy](https://github.com/maks-emelyanov/sweepflow/security/policy).
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+      description: Describe what you expected, what happened, and which command or workflow is affected.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Include exact commands, relevant sanitized configuration, and the smallest synthetic CSV or fake-client scenario that reproduces the problem. Include timezone offsets and candle durations when relevant.
+      placeholder: |
+        Command:
+        Configuration:
+        Synthetic input or steps:
+        Sanitized output or traceback:
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include the SweepFlow version or commit, Python and uv versions, operating system, and optional integration versions if involved. State whether the Robinhood wrapper is installed.
+      placeholder: |
+        SweepFlow version or commit:
+        Python:
+        uv:
+        Operating system:
+        Optional integrations:
+    validations:
+      required: true
+  - type: textarea
+    id: validation
+    attributes:
+      label: Checks already tried
+      description: Share relevant test results or whether the included offline demo reproduces the issue. Mention any restart, data revision, or reconciliation conditions involved.
