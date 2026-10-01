@@ -25,7 +25,7 @@ def load_robinhood_data_source() -> type[RobinhoodDataSource]:
     try:
         from sweepflow.robinhood import RobinhoodDataSource
     except ModuleNotFoundError as exc:
-        if exc.name not in {"robinhood_mcp", "mcp_types"}:
+        if exc.name not in {"robinhood_mcp_wrapper", "mcp_types"}:
             raise
         raise ValueError(
             "Robinhood market data requires the optional robinhood-mcp-wrapper integration. "

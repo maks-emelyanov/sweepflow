@@ -15,7 +15,7 @@ import sys
 
 class WithoutWrapper(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
-        if fullname.split(".")[0] in {"robinhood_mcp", "mcp_types"}:
+        if fullname.split(".")[0] in {"robinhood_mcp_wrapper", "mcp_types"}:
             raise ModuleNotFoundError("Optional integration unavailable", name=fullname)
 
 sys.meta_path.insert(0, WithoutWrapper())

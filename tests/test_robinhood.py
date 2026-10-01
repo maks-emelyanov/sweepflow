@@ -7,11 +7,11 @@ from decimal import Decimal
 
 import pytest
 
-pytest.importorskip("robinhood_mcp", reason="Optional Robinhood wrapper is not installed")
+pytest.importorskip("robinhood_mcp_wrapper", reason="Optional Robinhood wrapper is not installed")
 
 from mcp_types import CallToolResult, TextContent
-from robinhood_mcp import RobinhoodMCPClient
-from robinhood_mcp.errors import UpstreamUnavailableError
+from robinhood_mcp_wrapper import RobinhoodMCPClient
+from robinhood_mcp_wrapper.errors import UpstreamUnavailableError
 
 from sweepflow.models import Bar
 from sweepflow.robinhood import (
@@ -617,28 +617,68 @@ def test_failed_concurrent_history_group_waits_for_remaining_requests():
 def test_concurrent_wrapper_failure_defers_transport_close_to_owner_task():
     async def exercise():
         class OwnerStack:
-            owner = asyncio.current_task()
+            owner = None
             closed = False
 
-            async def aclose(self):
+            async def __aenter__(self):
+                self.owner = asyncio.current_task()
+                return self
+
+            async def __aexit__(self, *_):
                 assert asyncio.current_task() is self.owner
                 self.closed = True
 
         client = _HistoricalClient()
+        source = RobinhoodDataSource(client)
         stack = OwnerStack()
-        client._stack = stack
+        stop = asyncio.Event()
+        ready = asyncio.Event()
+
+        async def own_connection():
+            async with stack:
+                ready.set()
+                await stop.wait()
+
+        owner_task = asyncio.create_task(own_connection())
+        client._connection_task = owner_task
+        client._connection_stop = stop
         client._client = object()
+        await ready.wait()
+        assert stack.owner is owner_task
+
+        workers_ready = asyncio.Event()
+        request_count = 0
 
         async def unavailable(_):
+            nonlocal request_count
+            request_count += 1
+            if request_count == 2:
+                workers_ready.set()
+            await workers_ready.wait()
             raise OSError("upstream disconnected")
 
-        [failure] = await asyncio.gather(client._invoke(unavailable), return_exceptions=True)
-        assert isinstance(failure, UpstreamUnavailableError)
+        failures = await asyncio.wait_for(
+            asyncio.gather(
+                client._invoke(unavailable), client._invoke(unavailable), return_exceptions=True
+            ),
+            timeout=5,
+        )
+        assert all(isinstance(failure, UpstreamUnavailableError) for failure in failures)
         assert not stack.closed
+        assert not stop.is_set()
+        assert not owner_task.done()
+
+        async def unexpected_read(_):
+            pytest.fail("invalidated connection accepted another read")
+
         with pytest.raises(UpstreamUnavailableError, match="requires reconnect"):
-            await client.connect()
-        await client.close()
+            await client._invoke(unexpected_read)
+        await source.close()
         assert stack.closed
+        assert stop.is_set()
+        assert owner_task.done()
+        assert client._connection_task is None
+        assert client._connection_stop is None
         assert not client.connected
 
     asyncio.run(exercise())

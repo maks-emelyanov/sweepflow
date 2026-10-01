@@ -1,4 +1,4 @@
-"""Read-only market data through the installed :mod:`robinhood_mcp` client.
+"""Read-only market data through the installed :mod:`robinhood_mcp_wrapper` client.
 
 The wire names and shapes were verified with the server's tool discovery.  This
 adapter deliberately has no order submission method: Robinhood does not expose
@@ -15,9 +15,9 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from robinhood_mcp import RobinhoodMCPClient
-from robinhood_mcp.errors import UpstreamUnavailableError
-from robinhood_mcp.serialization import to_jsonable
+from robinhood_mcp_wrapper import RobinhoodMCPClient
+from robinhood_mcp_wrapper.errors import UpstreamUnavailableError
+from robinhood_mcp_wrapper.serialization import to_jsonable
 
 from sweepflow.data import FiveMinuteAggregator
 from sweepflow.integrations import UnsupportedExecutionError as UnsupportedExecutionError
@@ -84,11 +84,11 @@ def _payload(result: Any) -> dict[str, Any]:
 
 
 class _HistoricalClient(RobinhoodMCPClient):
-    """Keep transport teardown in the task that owns its context manager.
+    """Defer connection teardown until concurrent historical reads finish.
 
-    The installed wrapper closes AnyIO transport scopes immediately on request
-    failure. Concurrent read workers must defer that close to the source owner;
-    marking the session unusable still prevents subsequent reads from reusing it.
+    The wrapper closes its shared connection immediately on request failure.
+    Marking the session unusable prevents subsequent reads from reusing it while
+    the source owner waits for its workers and then closes the connection.
     """
 
     def __init__(self) -> None:
@@ -131,8 +131,8 @@ class RobinhoodDataSource:
         self._tools: dict[str, Any] | None = None
         self.last_repaired_bars = 0
         self.last_repaired_keys: set[tuple[str, datetime]] = set()
-        # An injected wrapper retains its original immediate-close behavior.
-        # Keep its requests in the caller's task rather than concurrent workers.
+        # An injected wrapper can close its shared connection on failure.
+        # Keep its requests serial so no concurrent workers are interrupted.
         self._batch_concurrency = (
             1
             if isinstance(self.client, RobinhoodMCPClient)

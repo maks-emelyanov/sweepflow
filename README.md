@@ -56,10 +56,12 @@ Fill in `ALPACA_API_KEY` and `ALPACA_API_SECRET` with a matching **paper-account
 
 The Robinhood wrapper and Alpaca dashboard are independent projects. Their source checkouts must be obtained separately; this repository does not assume a checkout location or a public package release. Install integrations into SweepFlow's environment using their actual paths:
 
+SweepFlow expects the wrapper's `robinhood_mcp_wrapper` Python package and `robinhood-mcp-wrapper` command. When upgrading an existing wrapper checkout, rerun the editable install below to refresh its package metadata and console command.
+
 ```bash
 # Needed for discover/fetch/scan/watch and paper market data.
 uv pip install --python .venv/bin/python --editable /absolute/path/to/robinhood
-uv run --no-sync robinhood-mcp auth login
+uv run --no-sync robinhood-mcp-wrapper auth login
 uv run --no-sync sweepflow discover
 
 # One read-only scan of a small universe.

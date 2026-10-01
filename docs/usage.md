@@ -22,8 +22,8 @@ Run `uv run --no-sync sweepflow COMMAND --help` for the full options.
 Authenticate through the installed wrapper when using Robinhood data:
 
 ```bash
-uv run --no-sync robinhood-mcp auth login
-# Headless alternative: uv run --no-sync robinhood-mcp auth login --manual
+uv run --no-sync robinhood-mcp-wrapper auth login
+# Headless alternative: uv run --no-sync robinhood-mcp-wrapper auth login --manual
 uv run --no-sync sweepflow discover
 
 # Download a dated, reviewable constituent proxy:
@@ -46,9 +46,11 @@ Global `--config` goes **before** the subcommand. Settings are strictly validate
 
 The adapter discovers Robinhood's actual tools through `RobinhoodMCPClient`, then calls `get_equity_historicals` with explicit `interval="minute"` or `"5minute"`, `bounds="regular"`, and split adjustment. It batches at most ten symbols and chunks long date ranges. It rejects malformed prices, interval/bounds mismatches, and upstream errors; forming or interpolated bars are excluded. It also exposes read-only account, portfolio, position, and order queries for library consumers. Shadow signals do not represent reconciliation with brokerage positions or executable order proposals.
 
+When a concurrent historical request has a transport or authentication failure, the default client marks the connection unusable. The source waits for the remaining requests in that batch group before closing it, which signals the wrapper's connection task to shut down its transport. Library consumers that inject a plain `RobinhoodMCPClient` use serial historical requests because that client closes its shared connection immediately on those failures.
+
 Robinhood's historical endpoint is **polled**, not a WebSocket feed; this implementation makes no claim of consolidated SIP coverage. Monitoring initializes from persisted bars, consumes only appended bars for unchanged symbols, and reconstructs affected symbols after revisions or backfills. It emits a signal only while its confirmation is fresh (default 90 seconds) and its setup remains pending. Every scan refreshes the entire previous regular session and the current session through the latest completed candle, so corrections to prior-day levels, older sweeps, and structure are applied on the next successful poll. Historical reads use at most four concurrent ten-symbol batches through the default client. Older retained candles still supply pivot context but are outside that refresh window. Revisions do not quarantine symbols: the rebuilt setup determines eligibility, subject to the existing missing-data and freshness checks. `revised_symbols` in scan/preparation output identifies changed inputs, and `data_revision` events record the candle timestamp, changed fields, and old/new values. Legacy quarantine rows are retained for historical audit but no longer block entries; the legacy `quarantined` output field is empty. Polling reconnects after errors and stops after three consecutive failures by default. No signals are emitted from failed reads. Use `--poll-seconds`, `--max-errors`, and `--max-signal-age` to tune monitoring; refreshing two sessions for hundreds of symbols increases read volume and may exceed the freshness budget.
 
-Preparation and scans attempt to repair uncached five-minute gaps using genuine one-minute history. A repair requires all five completed, consecutive regular-session minutes; interpolated or incomplete data cannot fill a gap. Optional repairs have a five-second budget, prioritize current-session gaps, and back off persistent older gaps for fifteen minutes. Persisted provenance keeps minute repairs eligible for revalidation after corrections and restarts; a native five-minute candle supersedes its repair. `repaired_bars` reports successful repairs. Unresolved gaps retain the existing symbol eligibility checks. If Robinhood reports that stored credentials require reauthorization, run `uv run --no-sync robinhood-mcp auth login --force` before the next session.
+Preparation and scans attempt to repair uncached five-minute gaps using genuine one-minute history. A repair requires all five completed, consecutive regular-session minutes; interpolated or incomplete data cannot fill a gap. Optional repairs have a five-second budget, prioritize current-session gaps, and back off persistent older gaps for fifteen minutes. Persisted provenance keeps minute repairs eligible for revalidation after corrections and restarts; a native five-minute candle supersedes its repair. `repaired_bars` reports successful repairs. Unresolved gaps retain the existing symbol eligibility checks. If Robinhood reports that stored credentials require reauthorization, run `uv run --no-sync robinhood-mcp-wrapper auth login --force` before the next session.
 
 ```bash
 # Export five-minute bars for strategy inspection:
@@ -57,7 +59,7 @@ uv run --no-sync sweepflow fetch --symbols SPY --bar-minutes 5 \
   --output data/spy_5m.csv
 uv run --no-sync sweepflow signals data/spy_5m.csv --db data/signals.sqlite
 
-# Fetch actual minute history through robinhood_mcp, then replay it:
+# Fetch actual minute history through robinhood_mcp_wrapper, then replay it:
 uv run --no-sync sweepflow fetch --symbols SPY --bar-minutes 1 \
   --start 2026-09-21T13:30:00Z --end 2026-09-22T20:00:00Z \
   --output data/spy_1m.csv
