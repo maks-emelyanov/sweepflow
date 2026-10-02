@@ -2,14 +2,18 @@
 
 ## Strategy rules
 
-Each symbol has independent state. Only a complete immediately preceding **regular exchange session** supplies PDH/PDL. The XNYS calendar handles weekends, holidays, daylight saving, and early closes. Data before/after the regular session is not used.
+Each symbol has independent state. Live monitoring and paper trading use the high/low of the genuine completed daily candle from the immediately preceding **regular exchange session** for PDH/PDL. Incomplete or absent previous-session five-minute history does not veto those levels; it supplies causal pivot context only. A missing daily candle for the required session blocks that symbol, and an older daily candle cannot substitute. The XNYS calendar handles weekends, holidays, daylight saving, and early closes. Data before/after the regular session is not used.
+
+Session and signal records report `previous_session_level_source="daily"` and the diagnostic five-minute coverage fields `previous_session_complete`, `previous_session_bars`, and `previous_session_expected_bars`. Current-session missing opening bars or internal gaps still block setups. Pivot confirmation requires consecutive observed candles: after a prior-session gap, structure can rebuild from a contiguous tail, but cannot bridge a missing prior-session close into the current session. Without prior pivot context, a setup must wait for a pivot confirmed from current-session candles before its sweep.
+
+Offline `signals` and `replay` have no daily feed, so PDH/PDL require a complete immediately preceding intraday session and use `previous_session_level_source="intraday"`. Library callers supplying daily inputs use daily levels exclusively, with no intraday fallback when the required daily candle is absent.
 
 1. A wick strictly beyond PDL starts a long candidate; strictly beyond PDH starts a short candidate. A bar breaking both levels is skipped.
 2. Freeze the latest confirmed swing high/low that existed **before** the sweep. Pivots are strict against the configured left candles and non-strict against right candles. A pivot confirmed by the sweep candle itself is ineligible.
 3. A subsequent candle must **close** through that level within the next three five-minute candles, including the third. The sweep candle cannot also be its own BOS.
 4. BOS must be the middle candle B of A/B/C. The immediately following C must close with `C.low > A.high` for a long, or `C.high < A.low` for a short.
 5. Choose the first-touch edge, midpoint, or deep edge. Set the stop beyond the complete sweep-through-C extreme plus the tick buffer. Target the opposite prior-session extreme. Apply the minimum 2.5R filter **before** submitting a paper limit entry.
-6. Invalidate on a missed BOS deadline, failed FVG, opposite target touch before entry, expired setup window, or missing data. Pending signals also invalidate on a stop touch or close through the far FVG edge. An existing position prevents new setups.
+6. Invalidate on a missed BOS deadline, failed FVG, opposite target touch before entry, expired setup window, or missing current-session data. Pending signals also invalidate on a stop touch or close through the far FVG edge. An existing position prevents new setups.
 
 Setup windows use the **completed candle's timestamp**, with an exclusive end. At 10:30 a new setup cannot be confirmed, and unfilled entries expire. An existing position retains its exits past the setup window. Replay flattens remaining positions at the regular-session close, using the final minute's close. One setup attempt per symbol per session is the default; even a rejected single-direction sweep consumes an attempt. Ambiguous dual sweeps do not.
 

@@ -13,6 +13,7 @@ from pathlib import Path
 
 from sweepflow.data import bar_from_dict, bar_to_dict
 from sweepflow.models import Bar, Signal
+from sweepflow.sessions import SessionCalendar
 
 
 def json_default(value):
@@ -48,6 +49,10 @@ class Journal:
                 symbol TEXT NOT NULL, start TEXT NOT NULL, payload TEXT NOT NULL,
                 PRIMARY KEY(symbol, start)
             );
+            CREATE TABLE IF NOT EXISTS daily_bars (
+                symbol TEXT NOT NULL, start TEXT NOT NULL, payload TEXT NOT NULL,
+                PRIMARY KEY(symbol, start)
+            );
             CREATE TABLE IF NOT EXISTS decisions (
                 id INTEGER PRIMARY KEY, recorded_at TEXT NOT NULL,
                 kind TEXT NOT NULL, payload TEXT NOT NULL
@@ -66,7 +71,9 @@ class Journal:
             );
         """)
         self._bar_cache: dict[tuple[str, datetime], Bar] | None = None
+        self._daily_bar_cache: dict[tuple[str, datetime], Bar] | None = None
         self._bar_data_version: int | None = None
+        self._daily_calendar: SessionCalendar | None = None
         self._scan_cache = None
         self.bar_generation = 0
 
@@ -79,6 +86,7 @@ class Journal:
     def close(self) -> None:
         self.connection.close()
         self._bar_cache = None
+        self._daily_bar_cache = None
         self._scan_cache = None
 
     def get_alpaca_state(self, account_id: str) -> dict | None:
@@ -177,24 +185,7 @@ class Journal:
                 payload = dumps(bar_to_dict(bar))
                 if previous is not None:
                     revised.add(bar.symbol)
-                    changed = [
-                        "duration_seconds" if field == "duration" else field
-                        for field in ("open", "high", "low", "close", "volume", "duration")
-                        if getattr(previous, field) != getattr(bar, field)
-                    ]
-                    event = {
-                        "event": "data_revision",
-                        "symbol": bar.symbol,
-                        "session": session,
-                        "start": timestamp,
-                        "changed_fields": changed,
-                        "before": bar_to_dict(previous),
-                        "after": bar_to_dict(bar),
-                    }
-                    self.connection.execute(
-                        "INSERT INTO decisions(recorded_at,kind,payload) VALUES(?,?,?)",
-                        (datetime.now(UTC).isoformat(), "data_revision", dumps(event)),
-                    )
+                    self._record_bar_revision(previous, bar, session)
                 self.connection.execute(
                     "INSERT INTO bars VALUES(?,?,?) ON CONFLICT(symbol,start) "
                     "DO UPDATE SET payload=excluded.payload",
@@ -206,6 +197,60 @@ class Journal:
             cached.update(updates)
             self.bar_generation += 1
         return revised
+
+    def store_daily_bars(self, bars: list[Bar], session: date) -> set[str]:
+        """Persist full regular-session daily candles separately from intraday inputs."""
+        cached = self._cached_daily_bars()
+        if self._daily_calendar is None:
+            self._daily_calendar = SessionCalendar()
+        revised = set()
+        updates: dict[tuple[str, datetime], Bar] = {}
+        with self.connection:
+            for bar in bars:
+                regular = self._daily_calendar.session_for(bar.start)
+                if regular is None or bar.start != regular.open or bar.end != regular.close:
+                    raise ValueError("Daily bars must cover a full regular exchange session")
+                start = bar.start.astimezone(UTC)
+                key = (bar.symbol, start)
+                previous = updates.get(key, cached.get(key))
+                if previous == bar:
+                    continue
+                if previous is not None:
+                    revised.add(bar.symbol)
+                    self._record_bar_revision(previous, bar, session, timeframe="day")
+                self.connection.execute(
+                    "INSERT INTO daily_bars VALUES(?,?,?) ON CONFLICT(symbol,start) "
+                    "DO UPDATE SET payload=excluded.payload",
+                    (bar.symbol, start.isoformat(), dumps(bar_to_dict(bar))),
+                )
+                updates[key] = bar
+        if updates:
+            cached.update(updates)
+            self.bar_generation += 1
+        return revised
+
+    def _record_bar_revision(
+        self, previous: Bar, bar: Bar, session: date, *, timeframe: str | None = None
+    ) -> None:
+        event = {
+            "event": "data_revision",
+            "symbol": bar.symbol,
+            "session": session,
+            "start": bar.start.astimezone(UTC).isoformat(),
+            "changed_fields": [
+                "duration_seconds" if field == "duration" else field
+                for field in ("open", "high", "low", "close", "volume", "duration")
+                if getattr(previous, field) != getattr(bar, field)
+            ],
+            "before": bar_to_dict(previous),
+            "after": bar_to_dict(bar),
+        }
+        if timeframe is not None:
+            event["timeframe"] = timeframe
+        self.connection.execute(
+            "INSERT INTO decisions(recorded_at,kind,payload) VALUES(?,?,?)",
+            (datetime.now(UTC).isoformat(), "data_revision", dumps(event)),
+        )
 
     def repaired_bars_since(self, start: datetime | None = None) -> set[tuple[str, datetime]]:
         if start is None:
@@ -234,14 +279,35 @@ class Journal:
                 for (payload,) in self.connection.execute("SELECT payload FROM bars")
                 for bar in (bar_from_dict(json.loads(payload)),)
             }
+            self._daily_bar_cache = {
+                (bar.symbol, bar.start.astimezone(UTC)): bar
+                for (payload,) in self.connection.execute("SELECT payload FROM daily_bars")
+                for bar in (bar_from_dict(json.loads(payload)),)
+            }
             self._bar_data_version = version
             self.bar_generation += 1
         return self._bar_cache
+
+    def _cached_daily_bars(self) -> dict[tuple[str, datetime], Bar]:
+        self._cached_bars()
+        assert self._daily_bar_cache is not None
+        return self._daily_bar_cache
 
     def bars_since(self, start: datetime | None = None) -> list[Bar]:
         cutoff = start.astimezone(UTC) if start is not None else None
         return sorted(
             (bar for (_, at), bar in self._cached_bars().items() if cutoff is None or at >= cutoff),
+            key=lambda bar: (bar.start, bar.symbol),
+        )
+
+    def daily_bars_since(self, start: datetime | None = None) -> list[Bar]:
+        cutoff = start.astimezone(UTC) if start is not None else None
+        return sorted(
+            (
+                bar
+                for (_, at), bar in self._cached_daily_bars().items()
+                if cutoff is None or at >= cutoff
+            ),
             key=lambda bar: (bar.start, bar.symbol),
         )
 

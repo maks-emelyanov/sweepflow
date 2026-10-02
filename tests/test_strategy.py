@@ -33,9 +33,16 @@ def history(calendar, symbol="AAPL"):
     return bars
 
 
-def warmed(calendar, config=None, bars=None):
+def daily_bar(calendar, *, day=PRIOR, high="110", low="99"):
+    session = calendar.session(day)
+    return replace(make_bar(session.open, h=high, lo=low), duration=session.close - session.open)
+
+
+def warmed(calendar, config=None, bars=None, *, daily_bars=None):
     events = []
-    engine = StrategyEngine(config=config, calendar=calendar, on_event=events.append)
+    engine = StrategyEngine(
+        config=config, calendar=calendar, on_event=events.append, daily_bars=daily_bars
+    )
     for item in bars if bars is not None else history(calendar):
         assert engine.on_bar(item) is None
     return engine, events
@@ -81,6 +88,9 @@ def test_complete_long_and_short_flow_and_audit(calendar, short):
     assert signal.entry == D("99.8" if short else "100.2")
     assert signal.stop == D("101.21" if short else "98.79")
     assert signal.target == D("90" if short else "110")
+    assert signal.metadata["previous_session_complete"] is True
+    assert signal.metadata["previous_session_bars"] == 78
+    assert signal.metadata["previous_session_expected_bars"] == 78
     assert signal.reward_risk >= D("2.5")
     assert signal.created_at == current[-1].end
     assert signal.expires_at == calendar.session(TODAY).open + timedelta(minutes=60)
@@ -226,12 +236,88 @@ def test_missing_bar_halts_session(calendar):
     assert events[-1]["reason"] == "missing_candle"
 
 
-def test_partial_prior_session_is_not_a_daily_level(calendar):
+@pytest.mark.parametrize("missing", [0, 30])
+@pytest.mark.parametrize("short", [False, True])
+def test_daily_bar_supplies_levels_with_partial_prior_session_and_tail_pivots(
+    calendar, missing, short
+):
     prior = history(calendar)
-    engine, events = warmed(calendar, bars=prior[:30] + prior[31:])
+    current = setup_bars(calendar)
+    daily = daily_bar(calendar)
+    if short:
+        prior, current = [mirror(item) for item in prior], [mirror(item) for item in current]
+        daily = mirror(daily)
+    del prior[missing]
+    engine, events = warmed(calendar, bars=prior, daily_bars=[daily])
+    assert engine.state_for("AAPL").halted
+    (signal,) = feed(engine, current)
+    state = engine.state_for("AAPL")
+    assert not state.halted
+    assert state.previous_high == max(bar.high for bar in prior)
+    assert state.previous_low == min(bar.low for bar in prior)
+    assert signal.target == D("90" if short else "110")
+    assert signal.metadata["structure_level"] == "100"
+    assert signal.metadata["previous_session_level_source"] == "daily"
+    assert signal.metadata["previous_session_complete"] is False
+    assert signal.metadata["previous_session_bars"] == 77
+    assert signal.metadata["previous_session_expected_bars"] == 78
+    quality = [event for event in events if event.get("kind") == "data_quality"]
+    assert quality[-1]["reason"] == "previous_session_incomplete"
+    assert quality[-1]["previous_session_bars"] == 77
+
+
+@pytest.mark.parametrize("missing", [72, 74, 75, 77])
+def test_prior_gaps_cannot_supply_pivots_across_missing_candles(calendar, missing):
+    prior = history(calendar)
+    del prior[missing]
+    engine, events = warmed(calendar, bars=prior, daily_bars=[daily_bar(calendar)])
     assert not feed(engine, setup_bars(calendar))
-    assert engine.state_for("AAPL").previous_high is None
-    assert any(event.get("reason") == "previous_session_incomplete" for event in events)
+    state = engine.state_for("AAPL")
+    assert state.previous_high == D("110")
+    assert state.previous_low == D("99")
+    assert state.previous_session_complete is False
+    assert not state.halted
+    assert any(event.get("reason") == "no_pre_sweep_confirmed_pivot" for event in events)
+
+
+def test_missing_prior_close_allows_setup_after_current_session_pivot(calendar):
+    engine, _ = warmed(calendar, bars=history(calendar)[:-1], daily_bars=[daily_bar(calendar)])
+    start = calendar.session(TODAY).open
+    # Establish structure with consecutive current-session candles before sweeping.
+    prefix = [make_bar(start + timedelta(minutes=5 * i)) for i in range(5)]
+    prefix[2] = replace(prefix[2], high=D("100"))
+    assert not feed(engine, prefix)
+    current = [
+        replace(bar, start=bar.start + timedelta(minutes=25)) for bar in setup_bars(calendar)
+    ]
+    (signal,) = feed(engine, current)
+    assert signal.target == D("110")
+    assert signal.metadata["previous_session_complete"] is False
+    assert signal.metadata["structure_level"] == "100"
+
+
+def test_missing_current_open_clears_prior_pivot_context_and_halts_session(calendar):
+    engine, events = warmed(calendar)
+    assert engine.state_for("AAPL").swing_high == D("100")
+    current = setup_bars(calendar)
+    assert engine.on_bar(current[1]) is None
+    state = engine.state_for("AAPL")
+    assert state.halted
+    assert state.swing_high is None
+    assert state.swing_low is None
+    assert state.history == [current[1]]
+    assert engine.on_bar(current[2]) is None
+    assert any(event.get("reason") == "missing_session_open" for event in events)
+
+
+def test_missing_prior_session_still_cannot_supply_levels(calendar):
+    engine, events = warmed(calendar, bars=[])
+    assert not feed(engine, setup_bars(calendar))
+    state = engine.state_for("AAPL")
+    assert state.previous_high is None
+    assert state.previous_low is None
+    assert state.previous_session_bars == 0
+    assert any(event.get("reason") == "previous_session_missing" for event in events)
 
 
 def test_stale_prior_session_is_not_a_daily_level(calendar):
@@ -239,6 +325,70 @@ def test_stale_prior_session_is_not_a_daily_level(calendar):
     shifted = [replace(item, start=item.start + timedelta(days=1)) for item in setup_bars(calendar)]
     assert not feed(engine, shifted)
     assert engine.state_for("AAPL").previous_high is None
+
+
+def test_daily_high_overrides_complete_intraday_range(calendar):
+    engine, _ = warmed(calendar, daily_bars=[daily_bar(calendar, high="112")])
+    (signal,) = feed(engine, setup_bars(calendar))
+    assert signal.target == D("112")
+    assert signal.metadata["pdh"] == "112"
+    assert signal.metadata["previous_session_level_source"] == "daily"
+
+
+def test_daily_low_controls_sweep_detection(calendar):
+    engine, _ = warmed(calendar, daily_bars=[daily_bar(calendar, low="98")])
+    assert not feed(engine, setup_bars(calendar))
+    state = engine.state_for("AAPL")
+    assert state.previous_low == D("98")
+    assert state.phase is SetupState.WAITING
+    assert state.attempts == 0
+
+
+def test_daily_levels_allow_setup_without_prior_intraday_history(calendar):
+    engine, _ = warmed(calendar, bars=[], daily_bars=[daily_bar(calendar)])
+    start = calendar.session(TODAY).open
+    prefix = [make_bar(start + timedelta(minutes=5 * i)) for i in range(5)]
+    prefix[2] = replace(prefix[2], high=D("100"))
+    assert not feed(engine, prefix)
+    current = [
+        replace(bar, start=bar.start + timedelta(minutes=25)) for bar in setup_bars(calendar)
+    ]
+    (signal,) = feed(engine, current)
+    assert signal.target == D("110")
+    assert signal.metadata["previous_session_level_source"] == "daily"
+    assert signal.metadata["previous_session_bars"] == 0
+    assert signal.metadata["previous_session_complete"] is False
+
+
+@pytest.mark.parametrize("daily_date", [None, date(2025, 5, 30), TODAY])
+def test_missing_or_wrong_session_daily_cannot_fall_back_to_intraday(calendar, daily_date):
+    daily = [] if daily_date is None else [daily_bar(calendar, day=daily_date)]
+    engine, events = warmed(calendar, daily_bars=daily)
+    assert not feed(engine, setup_bars(calendar))
+    state = engine.state_for("AAPL")
+    assert state.previous_session_complete is True
+    assert state.previous_high is None
+    assert state.previous_low is None
+    assert state.previous_session_level_source is None
+    assert any(event.get("reason") == "previous_session_daily_bar_missing" for event in events)
+
+
+def test_offline_partial_intraday_history_cannot_supply_daily_levels(calendar):
+    prior = history(calendar)
+    del prior[30]
+    engine, events = warmed(calendar, bars=prior)
+    assert not feed(engine, setup_bars(calendar))
+    assert engine.state_for("AAPL").previous_high is None
+    assert any(event.get("reason") == "previous_session_incomplete" for event in events)
+
+
+def test_daily_inputs_reject_intraday_or_conflicting_bars(calendar):
+    engine = StrategyEngine(calendar=calendar)
+    with pytest.raises(ValueError, match="complete regular exchange session"):
+        engine.set_daily_bars([history(calendar)[0]])
+    daily = daily_bar(calendar)
+    with pytest.raises(ValueError, match="Conflicting daily bars"):
+        engine.set_daily_bars([daily, replace(daily, high=D("112"))])
 
 
 def test_duplicate_ignored_revision_and_incomplete_rejected(calendar):

@@ -13,6 +13,8 @@ SweepFlow is a Python workflow for researching and paper trading a **prior-day l
 | Shadow monitoring | Robinhood market data | Journals fresh signals without sending orders |
 | Alpaca paper trading | Robinhood signals and an Alpaca paper account | Submits paper limit brackets and reconciles orders and positions |
 
+Monitoring and paper trading take PDH/PDL from Robinhood's completed daily candle for the immediately preceding regular exchange session. Missing previous-session five-minute candles do not disqualify a symbol; those candles supply pivot context. Offline CSV commands require complete previous-session intraday history to reconstruct the levels. See [Usage and data](docs/usage.md#data-and-execution).
+
 **Real-money order submission is unavailable.** Alpaca execution accepts only its fixed HTTPS paper endpoint. SweepFlow uses Robinhood for read-only data; its `live` command explains the execution limitation before making any network call. Synthetic examples and replay results are research outputs, not evidence of profitability.
 
 ## Quick start

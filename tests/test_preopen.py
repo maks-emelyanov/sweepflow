@@ -6,7 +6,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
-from test_monitor import FakeSource, scenario
+from test_monitor import FakeSource, daily_history, scenario
 
 from sweepflow.config import AppConfig
 from sweepflow.models import Bar, Signal
@@ -28,8 +28,12 @@ def test_preparation_persists_previous_session_without_emitting_signals():
             assert result.symbols == 1
             assert result.bars_fetched == 78
             assert result.missing_symbols == ()
+            assert result.daily_bars_fetched == 1
+            assert result.missing_daily_symbols == ()
             assert source.calls == [(("AAPL",), previous.open, previous.close, now)]
+            assert source.daily_calls == [(("AAPL",), previous, now)]
             assert journal.bars_since() == bars[:78]
+            assert journal.daily_bars_since() == daily_history(bars[:78])
             assert journal.connection.execute("SELECT COUNT(*) FROM signals").fetchone()[0] == 0
             assert not any(
                 event.get("event") == "alpaca-paper_signal" for event in journal.events()
@@ -53,7 +57,9 @@ def test_preparation_outside_preopen_does_not_fetch(when):
             result = await prepare_session(source, ["AAPL"], config, journal, clock=lambda: now)
             assert result.status == "not_preopen"
             assert source.calls == []
+            assert source.daily_calls == []
             assert journal.bars_since() == []
+            assert journal.daily_bars_since() == []
 
     asyncio.run(check())
 
@@ -89,7 +95,10 @@ def test_preparation_respects_prior_session_holidays_dst_and_early_closes(day):
             )
             assert result.status == "ready"
             assert result.bars_fetched == count
+            assert result.daily_bars_fetched == 1
             assert source.calls[0][1:3] == (previous.open, previous.close)
+            assert source.daily_calls[0][1] == previous
+            assert journal.daily_bars_since() == daily_history(bars)
 
     asyncio.run(check())
 
@@ -105,13 +114,55 @@ def test_preparation_reports_missing_history_and_repairs_it_on_retry():
             )
             assert incomplete.status == "incomplete"
             assert incomplete.missing_symbols == ("AAPL", "MSFT")
+            assert incomplete.missing_daily_symbols == ("MSFT",)
             source.bars = bars + [replace(bar, symbol="MSFT") for bar in bars]
+            source.daily_bars = daily_history(source.bars)
             repaired = await prepare_session(
                 source, ["AAPL", "MSFT"], config, journal, clock=lambda: now
             )
             assert repaired.status == "ready"
             assert repaired.missing_symbols == ()
+            assert repaired.missing_daily_symbols == ()
             assert repaired.quarantined == ()
+
+    asyncio.run(check())
+
+
+def test_incomplete_preparation_allows_fresh_current_session_signal():
+    async def check():
+        bars, config, session = scenario()
+        source = FakeSource([bar for index, bar in enumerate(bars) if index != 30])
+        with Journal(":memory:") as journal:
+            prepared = await prepare_session(
+                source,
+                ["AAPL"],
+                config,
+                journal,
+                clock=lambda: session.open - timedelta(minutes=30),
+            )
+            assert prepared.status == "incomplete"
+            assert prepared.missing_symbols == ("AAPL",)
+            assert prepared.bars_fetched == 77
+            assert prepared.daily_bars_fetched == 1
+            assert prepared.missing_daily_symbols == ()
+            assert journal.connection.execute("SELECT COUNT(*) FROM signals").fetchone()[0] == 0
+            result = await scan(
+                source,
+                ["AAPL"],
+                config,
+                journal,
+                mode="alpaca-paper",
+                clock=lambda: session.open + timedelta(minutes=30, seconds=30),
+            )
+            assert len(result.new_signals) == 1
+            signal = result.new_signals[0]
+            assert signal.target == Decimal("110")
+            assert signal.metadata["previous_session_complete"] is False
+            assert signal.metadata["previous_session_bars"] == 77
+            assert signal.metadata["previous_session_expected_bars"] == 78
+            assert signal.metadata["previous_session_level_source"] == "daily"
+            assert result.quarantined == ()
+            assert result.stale_symbols == ()
 
     asyncio.run(check())
 
@@ -122,9 +173,9 @@ def test_preparation_refreshes_revised_daily_levels_without_quarantine_or_signal
         previous = SessionCalendar().previous_session(session.label)
         with Journal(":memory:") as journal:
             journal.store_bars(bars[:78], previous.label)
-            revised = list(bars)
-            revised[0] = replace(revised[0], high=Decimal("112"))
-            source = FakeSource(revised)
+            journal.store_daily_bars(daily_history(bars[:78]), session.label)
+            revised_daily = [replace(bar, high=Decimal("112")) for bar in daily_history(bars[:78])]
+            source = FakeSource(bars, daily_bars=revised_daily)
             result = await prepare_session(
                 source,
                 ["AAPL"],
@@ -136,12 +187,73 @@ def test_preparation_refreshes_revised_daily_levels_without_quarantine_or_signal
             assert result.quarantined == ()
             assert result.revised_symbols == ("AAPL",)
             assert source.calls[0][1:3] == (previous.open, previous.close)
-            assert journal.bars_since() == revised[:78]
+            assert journal.bars_since() == bars[:78]
+            assert journal.daily_bars_since() == revised_daily
             assert journal.quarantined(session.label) == set()
             assert journal.quarantined(previous.label) == set()
             assert journal.connection.execute("SELECT COUNT(*) FROM signals").fetchone()[0] == 0
             assert journal.events()[0]["event"] == "data_revision"
+            assert journal.events()[0]["timeframe"] == "day"
             assert journal.events()[0]["session"] == session.label.isoformat()
+
+    asyncio.run(check())
+
+
+def test_preparation_reports_missing_daily_despite_complete_intraday():
+    async def check():
+        bars, config, session = scenario()
+        source = FakeSource(bars, daily_bars=[])
+        with Journal(":memory:") as journal:
+            result = await prepare_session(
+                source,
+                ["AAPL"],
+                config,
+                journal,
+                clock=lambda: session.open - timedelta(minutes=30),
+            )
+            assert result.status == "incomplete"
+            assert result.missing_symbols == ()
+            assert result.missing_daily_symbols == ("AAPL",)
+            assert result.daily_bars_fetched == 0
+            assert journal.daily_bars_since() == []
+            assert journal.connection.execute("SELECT COUNT(*) FROM signals").fetchone()[0] == 0
+
+    asyncio.run(check())
+
+
+def test_prepared_daily_levels_survive_restart_without_previous_intraday(tmp_path):
+    async def check():
+        bars, config, session = scenario()
+        source = FakeSource(bars)
+        source.bars = []
+        path = tmp_path / "prepared.sqlite"
+        with Journal(path) as journal:
+            result = await prepare_session(
+                source,
+                ["AAPL"],
+                config,
+                journal,
+                clock=lambda: session.open - timedelta(minutes=30),
+            )
+            assert result.missing_symbols == ("AAPL",)
+            assert result.missing_daily_symbols == ()
+            assert journal.daily_bars_since() == daily_history(bars[:78])
+        source.bars = bars[78:]
+        source.daily_bars = []
+        with Journal(path) as journal:
+            scanned = await scan(
+                source,
+                ["AAPL"],
+                config,
+                journal,
+                mode="alpaca-paper",
+                clock=lambda: session.open + timedelta(minutes=30, seconds=30),
+            )
+            assert len(scanned.new_signals) == 1
+            assert scanned.new_signals[0].target == Decimal("110")
+            assert scanned.new_signals[0].metadata["previous_session_level_source"] == "daily"
+            assert scanned.daily_bars_fetched == 0
+            assert scanned.missing_daily_symbols == ()
 
     asyncio.run(check())
 

@@ -16,7 +16,7 @@ Before submitting a pull request, describe the behavior that changes and the che
 
 Pull requests from external contributors require a maintainer to approve GitHub Actions before CI runs.
 
-Strategy changes must preserve causal candle ordering, timezone-aware timestamps, decimal price/risk arithmetic, and complete prior-session validation. Execution changes must retain paper-only endpoints, durable order identity, reconciliation after ambiguous submissions, and ownership checks before canceling or closing exposure. Existing `liquidity:` UUID seeds and `liq-` client order prefixes are persisted compatibility identifiers.
+Strategy changes must preserve causal candle ordering, timezone-aware timestamps, decimal price/risk arithmetic, and current-session continuity checks. Live PDH/PDL use the genuine completed daily candle from the immediately preceding regular session, without intraday fallback; previous-session five-minute coverage is diagnostic and pivot confirmation must not bridge missing candles. Offline CSV modes require complete previous-session intraday history to reconstruct levels. Execution changes must retain paper-only endpoints, durable order identity, reconciliation after ambiguous submissions, and ownership checks before canceling or closing exposure. Existing `liquidity:` UUID seeds and `liq-` client order prefixes are persisted compatibility identifiers.
 
 When dependencies change, regenerate `uv.lock` with `uv lock` and verify `uv sync --locked`. Core package metadata must not depend on a developer's local filesystem. The dashboard and Robinhood wrapper remain separately installed integrations until a deliberate distribution strategy is adopted.
 

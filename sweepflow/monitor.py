@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 from sweepflow.config import AppConfig
 from sweepflow.models import Bar, Signal
-from sweepflow.sessions import NEW_YORK, SessionCalendar
+from sweepflow.sessions import NEW_YORK, Session, SessionCalendar
 from sweepflow.storage import Journal
 from sweepflow.strategy import StrategyEngine
 
@@ -32,6 +32,8 @@ class ScanResult:
     stale_symbols: tuple[str, ...] = ()
     revised_symbols: tuple[str, ...] = ()
     repaired_bars: int = 0
+    daily_bars_fetched: int = 0
+    missing_daily_symbols: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -43,6 +45,8 @@ class PreparationResult:
     quarantined: tuple[str, ...] = ()
     revised_symbols: tuple[str, ...] = ()
     repaired_bars: int = 0
+    daily_bars_fetched: int = 0
+    missing_daily_symbols: tuple[str, ...] = ()
 
 
 @dataclass
@@ -53,6 +57,7 @@ class _ScanCache:
     engine: StrategyEngine
     bars: dict[tuple[str, datetime], Bar]
     histories: dict[str, dict[datetime, Bar]]
+    daily_bars: dict[tuple[str, datetime], Bar]
     candidates: dict[str, dict[str, Signal]] = field(default_factory=dict)
 
 
@@ -61,6 +66,24 @@ async def _read_bars(source, symbols, start, end, *, now, known, repaired):
     if repair is not None:
         return await repair(symbols, start, end, now=now, known=known, repaired=repaired)
     return await source.get_bars(symbols, start, end, now=now)
+
+
+async def _read_daily_bars(source, symbols, session: Session, *, now) -> dict[str, Bar]:
+    """Require exact completed-session daily inputs, with no intraday fallback."""
+    daily = await source.get_daily_bars(symbols, session, now=now)
+    if not isinstance(daily, dict):
+        raise ValueError("Daily history must return a symbol-to-bar mapping")
+    for symbol, bar in daily.items():
+        if (
+            symbol not in symbols
+            or not isinstance(bar, Bar)
+            or bar.symbol != symbol
+            or bar.start != session.open
+            or bar.end != session.close
+            or bar.end > now
+        ):
+            raise ValueError("Daily bar must match the requested completed regular session")
+    return daily
 
 
 async def prepare_session(
@@ -88,6 +111,7 @@ async def prepare_session(
         return PreparationResult("not_preopen", len(symbols), 0)
     previous = calendar.previous_session(session.label)
     existing = journal.bars_since(previous.open)
+    daily = await _read_daily_bars(source, symbols, previous, now=now)
     cached = {
         (bar.symbol, bar.start)
         for bar in existing
@@ -98,7 +122,7 @@ async def prepare_session(
     while cursor + timedelta(minutes=5) <= previous.close:
         expected.append(cursor)
         cursor += timedelta(minutes=5)
-    # Prior-day levels and pivots can change anywhere in the previous session.
+    # Refresh intraday history for causal pivot context independently of levels.
     result = await _read_bars(
         source,
         symbols,
@@ -124,17 +148,26 @@ async def prepare_session(
     revised = journal.store_bars(
         bars, session.label, repaired_keys=getattr(source, "last_repaired_keys", set())
     )
+    revised.update(journal.store_daily_bars(list(daily.values()), session.label))
     cached.update((bar.symbol, bar.start) for bar in bars)
     missing = tuple(
         symbol for symbol in symbols if any((symbol, at) not in cached for at in expected)
     )
+    daily_symbols = {
+        bar.symbol
+        for bar in journal.daily_bars_since(previous.open)
+        if bar.start == previous.open and bar.end == previous.close
+    }
+    missing_daily = tuple(symbol for symbol in symbols if symbol not in daily_symbols)
     return PreparationResult(
-        "incomplete" if missing else "ready",
+        "incomplete" if missing or missing_daily else "ready",
         len(symbols),
         len(bars),
         missing,
         revised_symbols=tuple(sorted(revised)),
         repaired_bars=getattr(source, "last_repaired_bars", 0),
+        daily_bars_fetched=len(daily),
+        missing_daily_symbols=missing_daily,
     )
 
 
@@ -189,7 +222,8 @@ async def scan(
         return ScanResult("market_closed", len(symbols), 0, ())
     previous = calendar.previous_session(session.label)
     persisted = [bar for bar in journal.bars_since() if bar.symbol in symbols]
-    signature = (mode, config.strategy, symbols)
+    persisted_daily = [bar for bar in journal.daily_bars_since() if bar.symbol in symbols]
+    signature = (mode, config.strategy, symbols, "daily")
     cached, journal._scan_cache = journal._scan_cache, None
     if cached is not None and (
         cached.signature != signature
@@ -201,8 +235,15 @@ async def scan(
         cached.bars if cached is not None else {(bar.symbol, bar.start): bar for bar in persisted}
     )
     known = set(prior_bars)
-    # A correction can affect an older sweep, pivot, or prior-day extreme. Read
-    # both complete session ranges each poll instead of only overlapping the tail.
+    prior_daily = {(bar.symbol, bar.start): bar for bar in persisted_daily}
+    daily = await _read_daily_bars(source, symbols, previous, now=requested_at)
+    # Daily reads for a full universe can cross a candle boundary. Include bars
+    # completed during that fetch rather than delaying them until the next scan.
+    requested_at = clock()
+    if not session.open <= requested_at < session.close:
+        return ScanResult("market_closed", len(symbols), 0, ())
+    # A daily correction changes levels; intraday corrections change pivots and
+    # setups. Refresh both inputs each poll instead of only overlapping the tail.
     result = await _read_bars(
         source,
         symbols,
@@ -216,18 +257,36 @@ async def scan(
         (bar for values in result.values() for bar in values),
         key=lambda bar: (bar.start, bar.symbol),
     )
-    changed = {
-        (bar.symbol, bar.start)
-        for bar in fresh_bars
-        if (bar.symbol, bar.start) in prior_bars and prior_bars[(bar.symbol, bar.start)] != bar
-    }
     revised = journal.store_bars(
         fresh_bars, session.label, repaired_keys=getattr(source, "last_repaired_keys", set())
     )
+    revised.update(journal.store_daily_bars(list(daily.values()), session.label))
+    # Reads yield to other journal writers. Use committed inputs after fetching
+    # and storing so their corrections affect this poll, including cached data
+    # omitted by a successful upstream response. Concurrent appends beyond this
+    # poll's cutoff remain in the journal for a later scan to consume.
+    inputs = {
+        (bar.symbol, bar.start): bar
+        for bar in journal.bars_since()
+        if bar.symbol in symbols and bar.end <= requested_at
+    }
+    daily_inputs = {
+        (bar.symbol, bar.start): bar for bar in journal.daily_bars_since() if bar.symbol in symbols
+    }
+    changed = {key for key, bar in inputs.items() if key in prior_bars and prior_bars[key] != bar}
+    revised.update(symbol for symbol, _ in changed)
+    revised.update(
+        symbol
+        for (symbol, at), bar in daily_inputs.items()
+        if (symbol, at) in prior_daily and prior_daily[(symbol, at)] != bar
+    )
+    daily_changed = {
+        symbol
+        for (symbol, at), bar in daily_inputs.items()
+        if cached is not None and cached.daily_bars.get((symbol, at)) != bar
+    }
     # Older confirmed pivots remain valid until superseded, so preserve all known
     # structure context across restarts, not just the daily-level warmup session.
-    inputs = dict(prior_bars)
-    inputs.update(((bar.symbol, bar.start), bar) for bar in fresh_bars)
     record_enabled = False
 
     def audit(event: dict) -> None:
@@ -235,7 +294,12 @@ async def scan(
             journal.record(event)
 
     if cached is None:
-        engine = StrategyEngine(config.strategy, calendar=calendar, on_event=audit)
+        engine = StrategyEngine(
+            config.strategy,
+            calendar=calendar,
+            on_event=audit,
+            daily_bars=list(daily_inputs.values()),
+        )
         histories: dict[str, dict[datetime, Bar]] = {}
         for bar in inputs.values():
             histories.setdefault(bar.symbol, {})[bar.start] = bar
@@ -244,11 +308,12 @@ async def scan(
     else:
         engine = cached.engine
         engine.on_event = audit
+        engine.set_daily_bars(list(daily_inputs.values()))
         histories = cached.histories
         candidates_by_symbol = cached.candidates
-        rebuild = set(revised)
+        rebuild = set(revised) | daily_changed
         appended = []
-        for bar in fresh_bars:
+        for bar in inputs.values():
             key = (bar.symbol, bar.start)
             if prior_bars.get(key) == bar:
                 continue
@@ -266,11 +331,15 @@ async def scan(
         for symbol in rebuild:
             engine.states.pop(symbol, None)
             candidates_by_symbol.pop(symbol, None)
-            replay.extend(histories[symbol].values())
+            replay.extend(histories.get(symbol, {}).values())
     for index, bar in enumerate(sorted(replay, key=lambda bar: (bar.start, bar.symbol))):
         if index % 200 == 0:
             await asyncio.sleep(0)  # Let paper reconciliation run during long reconstructions.
-        record_enabled = (bar.symbol, bar.start) not in known or (bar.symbol, bar.start) in changed
+        record_enabled = (
+            (bar.symbol, bar.start) not in known
+            or (bar.symbol, bar.start) in changed
+            or (bar.symbol in daily_changed and bar.start >= session.open)
+        )
         signal = engine.on_bar(bar, now=requested_at)
         if signal is not None and signal.created_at >= session.open:
             candidates_by_symbol.setdefault(signal.symbol, {})[signal.id] = signal
@@ -317,7 +386,11 @@ async def scan(
         elif fetched_at < signal.created_at:
             reason = "future_confirmation"
         if reason:
-            if confirmation_key not in known or signal.symbol in revised:
+            if (
+                confirmation_key not in known
+                or signal.symbol in revised
+                or signal.symbol in daily_changed
+            ):
                 journal.record(
                     {"event": "shadow_rejected", "signal_id": signal.id, "reason": reason}
                 )
@@ -341,6 +414,7 @@ async def scan(
         engine,
         inputs,
         histories,
+        daily_inputs,
         {
             symbol: {key: item for key, item in items.items() if item.created_at >= session.open}
             for symbol, items in candidates_by_symbol.items()
@@ -357,4 +431,6 @@ async def scan(
         tuple(sorted(stale)),
         tuple(sorted(revised)),
         getattr(source, "last_repaired_bars", 0),
+        len(daily),
+        tuple(symbol for symbol in symbols if (symbol, previous.open) not in daily_inputs),
     )

@@ -111,6 +111,7 @@ def test_fake_monitor_and_closed_market_paper_sync_work_without_wrapper():
         from examples.make_demo import demo_bars
         from sweepflow.config import AppConfig
         from sweepflow.data import FiveMinuteAggregator
+        from sweepflow.models import Bar
         from sweepflow.monitor import scan
         from sweepflow.paper import run_paper
         from sweepflow.storage import Journal
@@ -123,6 +124,23 @@ def test_fake_monitor_and_closed_market_paper_sync_work_without_wrapper():
         now = datetime(2026, 9, 22, 13, 45, 30, tzinfo=UTC)
 
         class FakeSource:
+            async def get_daily_bars(self, symbols, previous, *, now):
+                result = {}
+                for symbol in symbols:
+                    history = [
+                        bar for bar in bars
+                        if bar.symbol == symbol
+                        and previous.open <= bar.start and bar.end <= previous.close
+                    ]
+                    if history:
+                        result[symbol] = Bar(
+                            symbol, previous.open, history[0].open,
+                            max(bar.high for bar in history), min(bar.low for bar in history),
+                            history[-1].close,
+                            duration=previous.close - previous.open,
+                        )
+                return result
+
             async def get_bars(self, symbols, start, end, *, now):
                 return {
                     symbol: [

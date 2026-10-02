@@ -1,15 +1,16 @@
 """Deterministic completed-candle liquidity sweep → BOS → FVG strategy.
 
-Only an immediately preceding, complete regular session supplies daily levels.
+Live daily levels come from the immediately preceding regular-session daily bar.
+Offline callers without daily bars require complete intraday history for levels.
 A gap in the current session disables that symbol until the next session. Replay
 missing history chronologically in a fresh engine to repair an interrupted feed.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Any
 from uuid import NAMESPACE_URL, uuid5
@@ -38,6 +39,10 @@ class SymbolState:
     session: Session | None = None
     previous_high: Decimal | None = None
     previous_low: Decimal | None = None
+    previous_session_level_source: str | None = None
+    previous_session_complete: bool = False
+    previous_session_bars: int = 0
+    previous_session_expected_bars: int = 0
     session_bars: list[Bar] = field(default_factory=list)
     history: list[Bar] = field(default_factory=list)
     swing_high: Decimal | None = None
@@ -56,11 +61,33 @@ class StrategyEngine:
         config: StrategyConfig | None = None,
         calendar: SessionCalendar | None = None,
         on_event: Callable[[dict[str, Any]], None] | None = None,
+        *,
+        daily_bars: Sequence[Bar] | None = None,
     ) -> None:
         self.config = config or StrategyConfig()
         self.calendar = calendar or SessionCalendar()
         self.on_event = on_event
         self.states: dict[str, SymbolState] = {}
+        self.daily_bars: dict[tuple[str, date], Bar] | None = None
+        if daily_bars is not None:
+            self.set_daily_bars(daily_bars)
+
+    def set_daily_bars(self, bars: Sequence[Bar]) -> None:
+        """Replace authoritative daily inputs; callers rebuild changed symbols.
+
+        An empty sequence explicitly disables intraday-derived daily levels.
+        Each daily bar spans its exchange session rather than a fixed 24 hours.
+        """
+        daily = {}
+        for bar in bars:
+            session = self.calendar.session_for(bar.start)
+            if session is None or bar.start != session.open or bar.end != session.close:
+                raise ValueError("Daily bars must span a complete regular exchange session")
+            key = (bar.symbol, session.label)
+            if key in daily and daily[key] != bar:
+                raise ValueError("Conflicting daily bars for the same symbol and session")
+            daily[key] = bar
+        self.daily_bars = daily
 
     def state_for(self, symbol: str) -> SymbolState:
         return self.states.setdefault(symbol.upper(), SymbolState())
@@ -122,14 +149,17 @@ class StrategyEngine:
 
     def _new_session(self, symbol: str, state: SymbolState, session: Session, first: Bar) -> None:
         prior = self.calendar.previous_session(session.label)
-        previous_complete = bool(
-            state.session
-            and state.session.label == prior.label
-            and state.session_bars
+        previous_available = bool(
+            state.session and state.session.label == prior.label and state.session_bars
+        )
+        state.previous_session_bars = len(state.session_bars) if previous_available else 0
+        state.previous_session_expected_bars = (prior.close - prior.open) // timedelta(minutes=5)
+        state.previous_session_complete = bool(
+            previous_available
             and not state.halted
             and state.session_bars[0].start == prior.open
             and state.session_bars[-1].end == prior.close
-            and len(state.session_bars) == (prior.close - prior.open) // timedelta(minutes=5)
+            and state.previous_session_bars == state.previous_session_expected_bars
         )
         if state.phase in {
             SetupState.LIQUIDITY_SWEPT,
@@ -137,11 +167,25 @@ class StrategyEngine:
             SetupState.ENTRY_PENDING,
         }:
             self._invalidate(symbol, state, first.start, "session_ended")
-        if previous_complete:
+        if self.daily_bars is not None:
+            daily = self.daily_bars.get((symbol, prior.label))
+            state.previous_high = daily.high if daily is not None else None
+            state.previous_low = daily.low if daily is not None else None
+            state.previous_session_level_source = "daily" if daily is not None else None
+        elif state.previous_session_complete:
             state.previous_high = max(bar.high for bar in state.session_bars)
             state.previous_low = min(bar.low for bar in state.session_bars)
+            state.previous_session_level_source = "intraday"
         else:
             state.previous_high = state.previous_low = None
+            state.previous_session_level_source = None
+        # A normal overnight boundary preserves causal structure. Missing bars
+        # on either side of it must not become adjacent pivot candles.
+        if (
+            not previous_available
+            or state.session_bars[-1].end != prior.close
+            or first.start != session.open
+        ):
             state.history.clear()
             state.swing_high = state.swing_low = None
         state.session = session
@@ -156,13 +200,31 @@ class StrategyEngine:
             first.start,
             "session_started",
             previous_session=prior.label.isoformat(),
+            previous_session_level_source=state.previous_session_level_source,
             pdh=str(state.previous_high) if state.previous_high is not None else None,
             pdl=str(state.previous_low) if state.previous_low is not None else None,
+            previous_session_complete=state.previous_session_complete,
+            previous_session_bars=state.previous_session_bars,
+            previous_session_expected_bars=state.previous_session_expected_bars,
         )
         if state.halted:
             self._emit(symbol, first.start, "data_gap", reason="missing_session_open")
-        if not previous_complete:
-            self._emit(symbol, first.start, "warmup", reason="previous_session_incomplete")
+        if state.previous_high is None:
+            reason = "previous_session_missing"
+            if self.daily_bars is not None:
+                reason = "previous_session_daily_bar_missing"
+            elif previous_available:
+                reason = "previous_session_incomplete"
+            self._emit(symbol, first.start, "warmup", reason=reason)
+        if not state.previous_session_complete:
+            self._emit(
+                symbol,
+                first.start,
+                "data_quality",
+                reason="previous_session_incomplete",
+                previous_session_bars=state.previous_session_bars,
+                previous_session_expected_bars=state.previous_session_expected_bars,
+            )
 
     def _update_pivots(self, state: SymbolState, bar: Bar) -> None:
         state.history.append(bar)
@@ -221,8 +283,10 @@ class StrategyEngine:
             signal = self._process(state, bar, previous_bar)
         # Confirm pivots only AFTER processing the current candle. A pivot whose
         # last right-hand candle is the sweep did not exist before that sweep.
-        if not state.halted:
-            self._update_pivots(state, bar)
+        # Gaps halt trading for this session, but a subsequent contiguous run can
+        # still confirm structure for the next session. Gap handling clears the
+        # pivot window above so no pivot can bridge missing candles.
+        self._update_pivots(state, bar)
         return signal
 
     def _process(self, state: SymbolState, bar: Bar, previous_bar: Bar | None) -> Signal | None:
@@ -403,6 +467,10 @@ class StrategyEngine:
                 "session": state.session.label.isoformat() if state.session else None,
                 "pdh": str(state.previous_high),
                 "pdl": str(state.previous_low),
+                "previous_session_level_source": state.previous_session_level_source,
+                "previous_session_complete": state.previous_session_complete,
+                "previous_session_bars": state.previous_session_bars,
+                "previous_session_expected_bars": state.previous_session_expected_bars,
                 "sweep_at": setup.sweep.start.isoformat(),
                 "sweep_price": str(setup.sweep.low if bullish else setup.sweep.high),
                 "structure_level": str(setup.structure_level),

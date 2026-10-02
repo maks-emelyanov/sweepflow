@@ -23,7 +23,7 @@ from sweepflow.data import FiveMinuteAggregator
 from sweepflow.integrations import UnsupportedExecutionError as UnsupportedExecutionError
 from sweepflow.integrations import require_live_execution as require_live_execution
 from sweepflow.models import Bar
-from sweepflow.sessions import NEW_YORK, SessionCalendar
+from sweepflow.sessions import NEW_YORK, Session, SessionCalendar
 from sweepflow.universe import normalize_symbol
 
 
@@ -269,6 +269,68 @@ class RobinhoodDataSource:
             for symbol, items in bars.items()
         }
 
+    async def get_daily_bars(
+        self,
+        symbols: Sequence[str],
+        session: Session,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Bar]:
+        """Fetch genuine daily OHLC for exactly one completed regular session.
+
+        Daily bars use split-adjusted prices and regular bounds. Their upstream
+        labels may be UTC midnight or the regular-session open; returned bars
+        always span the calendar's open through close. Empty, interpolated, and
+        other-session candles provide no daily bar for the requested session.
+        """
+        calendar = SessionCalendar()
+        if not isinstance(session, Session) or calendar.session(session.label) != session:
+            raise ValueError("session must match a regular exchange session")
+        cutoff = _utc(now or datetime.now(UTC))
+        if isinstance(symbols, str):
+            raise TypeError("symbols must be a sequence, for example ['SPY']")
+        names = tuple(dict.fromkeys(normalize_symbol(symbol) for symbol in symbols))
+        if not names:
+            raise ValueError("at least one symbol is required")
+        if session.close > cutoff:
+            return {}
+        # Include UTC-midnight daily labels even though RTH opens hours later.
+        start = datetime.combine(session.label, datetime.min.time(), UTC)
+        end = min(start + timedelta(days=1), cutoff)
+        await self.discover()
+        batches = [names[offset : offset + 10] for offset in range(0, len(names), 10)]
+        collected: dict[str, Bar] = {}
+
+        async def read(batch: tuple[str, ...]) -> dict[str, Any]:
+            return await self._read(
+                "get_equity_historicals",
+                {
+                    "symbols": list(batch),
+                    "start_time": _timestamp(start),
+                    "end_time": _timestamp(end),
+                    "interval": "day",
+                    "bounds": "regular",
+                    "adjustment_type": "split",
+                },
+            )
+
+        for offset in range(0, len(batches), self._batch_concurrency):
+            group = batches[offset : offset + self._batch_concurrency]
+            if self._batch_concurrency == 1:
+                # Injected wrappers retain connection ownership in this task.
+                results = [await read(group[0])]
+            else:
+                results = await asyncio.gather(
+                    *(read(batch) for batch in group), return_exceptions=True
+                )
+            # Finish all workers before parsing results or propagating failure.
+            for data in results:
+                if isinstance(data, BaseException):
+                    raise data
+            for batch, data in zip(group, results, strict=True):
+                self._collect_daily_bars(data, batch, session, cutoff, calendar, collected)
+        return collected
+
     async def get_bars_with_repair(
         self,
         symbols: Sequence[str],
@@ -461,6 +523,87 @@ class RobinhoodDataSource:
                 if previous is not None and previous != bar:
                     raise RobinhoodDataError(f"Conflicting duplicate {symbol} candle")
                 collected[symbol][bar.start] = bar
+        if seen != set(batch):
+            raise RobinhoodDataError(f"Missing historical results: {sorted(set(batch) - seen)}")
+
+    @staticmethod
+    def _collect_daily_bars(
+        data: dict[str, Any],
+        batch: tuple[str, ...],
+        requested: Session,
+        cutoff: datetime,
+        calendar: SessionCalendar,
+        collected: dict[str, Bar],
+    ) -> None:
+        if data.get("not_found"):
+            raise RobinhoodDataError(f"Symbols not found: {data['not_found']}")
+        results = data.get("results")
+        if not isinstance(results, list):
+            raise RobinhoodDataError("Historical result is missing its results array")
+        seen: set[str] = set()
+        for result in results:
+            if not isinstance(result, dict):
+                raise RobinhoodDataError("Invalid historical symbol result")
+            symbol = result.get("symbol")
+            if symbol not in batch or symbol in seen:
+                raise RobinhoodDataError("Unexpected or repeated historical symbol")
+            seen.add(symbol)
+            if result.get("interval") != "day" or result.get("bounds") != "regular":
+                raise RobinhoodDataError("Expected daily regular-session candles")
+            rows = result.get("bars")
+            if rows is None:
+                rows = []
+            if not isinstance(rows, list):
+                raise RobinhoodDataError("Historical bars must be an array")
+            for row in rows:
+                if not isinstance(row, dict):
+                    raise RobinhoodDataError("Null or malformed candle")
+                interpolated = row.get("interpolated")
+                if interpolated is not None and not isinstance(interpolated, bool):
+                    raise RobinhoodDataError("Malformed interpolated candle flag")
+                if interpolated is True:
+                    continue
+                if row.get("session") not in (None, "", "reg"):
+                    raise RobinhoodDataError("Non-regular candle in regular-session response")
+                try:
+                    timestamp = _utc(datetime.fromisoformat(row["begins_at"]))
+                    # Midnight is a UTC trading-date label, not an ET timestamp.
+                    midnight = timestamp.replace(hour=0, minute=0, second=0, microsecond=0)
+                    session = (
+                        calendar.session(timestamp.date())
+                        if timestamp == midnight
+                        else calendar.session_for(timestamp)
+                    )
+                    if session is None or timestamp not in (midnight, session.open):
+                        raise ValueError(
+                            "daily candle must label a session at UTC midnight or open"
+                        )
+                    volume = row["volume"]
+                    if isinstance(volume, bool) or not isinstance(volume, int):
+                        raise ValueError("volume must be an integer")
+                    if any(
+                        not isinstance(row[field], str)
+                        for field in ("open_price", "high_price", "low_price", "close_price")
+                    ):
+                        raise ValueError("daily candle prices must be decimal strings")
+                    bar = Bar(
+                        symbol=symbol,
+                        start=session.open,
+                        open=Decimal(row["open_price"]),
+                        high=Decimal(row["high_price"]),
+                        low=Decimal(row["low_price"]),
+                        close=Decimal(row["close_price"]),
+                        volume=volume,
+                        duration=session.close - session.open,
+                    )
+                except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
+                    raise RobinhoodDataError(f"Malformed {symbol} daily candle: {exc}") from exc
+                if session != requested or bar.end > cutoff:
+                    continue
+                previous = collected.get(symbol)
+                if previous is not None and previous != bar:
+                    raise RobinhoodDataError(f"Conflicting duplicate {symbol} daily candle")
+                collected[symbol] = bar
         if seen != set(batch):
             raise RobinhoodDataError(f"Missing historical results: {sorted(set(batch) - seen)}")
 

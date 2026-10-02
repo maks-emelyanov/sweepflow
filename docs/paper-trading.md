@@ -2,6 +2,8 @@
 
 Use a dedicated Alpaca **paper** account and a POSIX host (Linux/WSL is the supported operating setup). Install the optional Robinhood wrapper and authenticate as described in [the README](../README.md#optional-integrations) before running the continuous `paper` workflow. One-shot `alpaca-sync` does not need the Robinhood wrapper.
 
+Paper scans use Robinhood's completed daily candle from the immediately preceding regular session for PDH/PDL. Previous-session five-minute gaps affect pivot context, while missing daily levels or current-session gaps block setups. Daily and intraday corrections rebuild affected symbols without resetting confirmation age. See [Usage and data](usage.md#data-and-execution) for coverage and revision fields.
+
 ## Alpaca paper account
 
 Copy [../.env.example](../.env.example) to `.env` if you do not already have a credentials file, then add the paper credentials (the file is git-ignored):

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -21,6 +21,7 @@ from sweepflow.robinhood import (
     _HistoricalClient,
     require_live_execution,
 )
+from sweepflow.sessions import Session, SessionCalendar
 
 NOW = datetime(2026, 9, 28, 14, 17, tzinfo=UTC)
 
@@ -709,4 +710,268 @@ def test_explicit_wrapper_keeps_serial_reads_in_its_owning_task():
         )
     )
     assert len(rows) == 21
+    assert len(client.calls) == 3
+
+
+def daily_candle(session, *, at_open=False, **overrides):
+    start = session.open if at_open else datetime.combine(session.label, datetime.min.time(), UTC)
+    return candle(begins_at=start.isoformat().replace("+00:00", "Z"), **overrides)
+
+
+def fetch_daily(client, *, session=None, now=None, symbols=("SPY",)):
+    session = session or SessionCalendar().session(date(2026, 9, 28))
+    return asyncio.run(
+        RobinhoodDataSource(client).get_daily_bars(
+            symbols, session, now=now or session.close + timedelta(days=1)
+        )
+    )
+
+
+@pytest.mark.parametrize("day", [date(2026, 9, 28), date(2026, 11, 27), date(2026, 3, 9)])
+@pytest.mark.parametrize("at_open", [False, True])
+def test_daily_history_canonicalizes_utc_dates_and_session_open_labels(day, at_open):
+    session = SessionCalendar().session(day)
+    client = FakeClient(
+        [
+            result(
+                {
+                    "results": [
+                        history(interval="day", bars=[daily_candle(session, at_open=at_open)])
+                    ]
+                }
+            )
+        ]
+    )
+    rows = fetch_daily(client, session=session)
+    assert rows == {
+        "SPY": Bar(
+            "SPY",
+            session.open,
+            "100.10",
+            "101.20",
+            "99.90",
+            "100.50",
+            volume=12345,
+            duration=session.close - session.open,
+        )
+    }
+    assert rows["SPY"].end == session.close
+    start = datetime.combine(session.label, datetime.min.time(), UTC)
+    assert client.calls == [
+        (
+            "get_equity_historicals",
+            {
+                "symbols": ["SPY"],
+                "interval": "day",
+                "bounds": "regular",
+                "adjustment_type": "split",
+                "start_time": start.isoformat().replace("+00:00", "Z"),
+                "end_time": (start + timedelta(days=1)).isoformat().replace("+00:00", "Z"),
+            },
+        )
+    ]
+
+
+def test_daily_history_uses_correct_session_only_and_omits_unavailable_symbols():
+    calendar = SessionCalendar()
+    session = calendar.session(date(2026, 9, 28))
+    older = calendar.previous_session(session.label)
+    current = calendar.session(date(2026, 9, 29))
+    client = FakeClient(
+        [
+            result(
+                {
+                    "results": [
+                        history(
+                            interval="day",
+                            bars=[
+                                daily_candle(older, high_price="200"),
+                                daily_candle(current, high_price="300"),
+                                daily_candle(session, interpolated=True, high_price="400"),
+                                daily_candle(session),
+                            ],
+                        ),
+                        history("VOO", [], interval="day"),
+                    ]
+                }
+            )
+        ]
+    )
+    rows = fetch_daily(client, session=session, now=current.open, symbols=["spy", "VOO", "SPY"])
+    assert set(rows) == {"SPY"}
+    assert rows["SPY"].high == Decimal("101.20")
+    assert client.calls[0][1]["symbols"] == ["SPY", "VOO"]
+
+
+@pytest.mark.parametrize("bars", [[], None, [candle(interpolated=True)]])
+def test_daily_missing_or_interpolated_bars_have_no_fabricated_result(bars):
+    payload = history(interval="day", bars=[])
+    payload["bars"] = bars
+    assert fetch_daily(FakeClient([result({"results": [payload]})])) == {}
+
+
+def test_daily_forming_session_is_not_requested_and_close_time_is_calendar_based():
+    session = SessionCalendar().session(date(2026, 11, 27))
+    client = FakeClient(
+        [result({"results": [history(interval="day", bars=[daily_candle(session)])]})]
+    )
+    assert fetch_daily(client, session=session, now=session.close - timedelta(microseconds=1)) == {}
+    assert client.calls == []
+    rows = fetch_daily(client, session=session, now=session.close)
+    assert rows["SPY"].duration == timedelta(hours=3, minutes=30)
+    assert client.calls[0][1]["end_time"] == session.close.isoformat().replace("+00:00", "Z")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"results": []},
+        {"results": [history(interval="5minute")]},
+        {"results": [history(interval="day", bounds="extended")]},
+        {"results": [history(interval="day", symbol="AAPL")]},
+        {"results": [history(interval="day", bars=[candle(begins_at="2026-09-28T00:00:00")])]},
+        {"results": [history(interval="day", bars=[candle()])]},
+        {"results": [history(interval="day", bars=[candle(begins_at="2026-09-26T00:00:00Z")])]},
+        {"results": [history(interval="day", bars=[candle(interpolated="true")])]},
+        {"results": [history(interval="day", bars=[candle(session="pre")])]},
+        {
+            "results": [
+                history(
+                    interval="day", bars=[candle(begins_at="2026-09-28T00:00:00Z", volume=True)]
+                )
+            ]
+        },
+        {
+            "results": [
+                history(
+                    interval="day",
+                    bars=[candle(begins_at="2026-09-28T00:00:00Z", high_price="NaN")],
+                )
+            ]
+        },
+        {"results": [history(interval="day", bars=[None])]},
+        {"results": [history(interval="day", bars={})]},
+        {"results": [history(interval="day")], "not_found": ["SPY"]},
+    ],
+)
+def test_daily_malformed_or_wrong_contract_history_fails_closed(payload):
+    with pytest.raises(RobinhoodDataError):
+        fetch_daily(FakeClient([result(payload)]))
+
+
+@pytest.mark.parametrize("day", [date(2026, 9, 25), date(2026, 9, 29)])
+def test_daily_other_session_cannot_substitute_when_target_history_is_absent(day):
+    other = SessionCalendar().session(day)
+    client = FakeClient(
+        [result({"results": [history(interval="day", bars=[daily_candle(other)])]})]
+    )
+    assert fetch_daily(client) == {}
+
+
+@pytest.mark.parametrize("prices", [True, 100, 100.0, None])
+def test_daily_prices_must_match_decimal_string_wire_contract(prices):
+    session = SessionCalendar().session(date(2026, 9, 28))
+    row = daily_candle(session)
+    row.update(
+        {field: prices for field in ("open_price", "high_price", "low_price", "close_price")}
+    )
+    client = FakeClient([result({"results": [history(interval="day", bars=[row])]})])
+    with pytest.raises(RobinhoodDataError, match="decimal strings"):
+        fetch_daily(client)
+
+
+def test_daily_identical_duplicate_labels_are_deduplicated_but_conflicts_fail():
+    session = SessionCalendar().session(date(2026, 9, 28))
+    bars = [daily_candle(session), daily_candle(session, at_open=True)]
+    assert set(
+        fetch_daily(FakeClient([result({"results": [history(interval="day", bars=bars)]})]))
+    ) == {"SPY"}
+    bars[1]["close_price"] = "100.60"
+    with pytest.raises(RobinhoodDataError, match="Conflicting duplicate"):
+        fetch_daily(FakeClient([result({"results": [history(interval="day", bars=bars)]})]))
+
+
+def test_daily_invalid_session_and_inputs_fail_before_upstream_call():
+    client = FakeClient()
+    source = RobinhoodDataSource(client)
+    session = SessionCalendar().session(date(2026, 9, 28))
+    with pytest.raises(ValueError, match="regular exchange session"):
+        asyncio.run(
+            source.get_daily_bars(
+                ["SPY"],
+                Session(session.label, session.open, session.close - timedelta(minutes=5)),
+                now=NOW,
+            )
+        )
+    with pytest.raises(ValueError, match="timezone"):
+        asyncio.run(source.get_daily_bars(["SPY"], session, now=NOW.replace(tzinfo=None)))
+    with pytest.raises(TypeError, match="sequence"):
+        asyncio.run(source.get_daily_bars("SPY", session, now=NOW))
+    with pytest.raises(ValueError, match="at least one"):
+        asyncio.run(source.get_daily_bars([], session, now=NOW))
+    assert client.calls == []
+
+
+def test_daily_batches_are_concurrent_bounded_and_finish_before_failure():
+    class ConcurrentClient(FakeClient):
+        active = 0
+        maximum = 0
+
+        async def call_tool(self, name, arguments):
+            self.active += 1
+            self.maximum = max(self.maximum, self.active)
+            try:
+                await asyncio.sleep(0)
+                return await super().call_tool(name, arguments)
+            finally:
+                self.active -= 1
+
+    names = [f"SYM{chr(65 + i // 26)}{chr(65 + i % 26)}" for i in range(51)]
+    client = ConcurrentClient()
+    assert fetch_daily(client, symbols=names) == {}
+    assert client.maximum == 4
+    assert [len(args["symbols"]) for _, args in client.calls] == [10, 10, 10, 10, 10, 1]
+    assert client.active == 0
+
+    class FailingClient(ConcurrentClient):
+        completed = []
+
+        async def call_tool(self, name, arguments):
+            await asyncio.sleep(0)
+            if arguments["symbols"][0] == names[0]:
+                raise RobinhoodDataError("failed daily batch")
+            await asyncio.sleep(0)
+            self.completed.append(arguments["symbols"][0])
+            return await super().call_tool(name, arguments)
+
+    failing = FailingClient()
+    with pytest.raises(RobinhoodDataError, match="failed daily batch"):
+        fetch_daily(failing, symbols=names)
+    assert failing.completed == [names[10], names[20], names[30]]
+    assert failing.active == 0
+
+
+def test_daily_explicit_wrapper_retains_serial_reads_in_owning_task():
+    class OwnerClient(RobinhoodMCPClient):
+        def __init__(self):
+            self.calls = []
+            self.owner = None
+
+        async def list_all_tools(self, *, refresh=False):
+            self.owner = asyncio.current_task()
+            return [{"name": "get_equity_historicals", "inputSchema": {"type": "object"}}]
+
+        async def call_tool(self, name, arguments):
+            assert asyncio.current_task() is self.owner
+            self.calls.append((name, arguments))
+            return result(
+                {
+                    "results": [
+                        history(symbol, [], interval="day") for symbol in arguments["symbols"]
+                    ]
+                }
+            )
+
+    client = OwnerClient()
+    assert fetch_daily(client, symbols=[f"SYMA{chr(65 + i)}" for i in range(21)]) == {}
     assert len(client.calls) == 3

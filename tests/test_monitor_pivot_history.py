@@ -5,6 +5,8 @@ from dataclasses import replace
 from datetime import date, timedelta
 from decimal import Decimal
 
+from test_monitor import FakeSource, daily_history
+
 from sweepflow.config import AppConfig
 from sweepflow.models import Bar
 from sweepflow.monitor import scan
@@ -53,26 +55,16 @@ def test_shadow_preserves_confirmed_pivot_older_than_previous_session():
             ),
         ]
     )
-    engine = StrategyEngine(calendar=calendar)
+    engine = StrategyEngine(calendar=calendar, daily_bars=daily_history(history))
     expected = [signal for item in history if (signal := engine.on_bar(item)) is not None]
     assert len(expected) == 1
 
-    class CachedSource:
-        async def get_bars(self, symbols, start, end, *, now):
-            return {
-                symbol: [
-                    item
-                    for item in history
-                    if item.symbol == symbol and start <= item.start and item.end <= end
-                ]
-                for symbol in symbols
-            }
-
     with Journal(":memory:") as journal:
         journal.store_bars(history, current.label)
+        journal.store_daily_bars(daily_history(history[:-3]), current.label)
         result = asyncio.run(
             scan(
-                CachedSource(),
+                FakeSource(history),
                 ["AAPL"],
                 AppConfig(),
                 journal,

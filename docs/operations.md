@@ -64,19 +64,32 @@ credential store; they are not embedded in the units. Logs use the system journa
 
 At **09:00 ET**, startup loads configuration, synchronizes the paper account, and
 refreshes State Street's S&P 500 universe. Before the open, it connects to Robinhood
-and downloads or repairs the previous trading session's completed five-minute
-history in the existing journal. Preparation creates no signals or entries.
-Incomplete history and connection failures retry while account reconciliation
-continues; successful preparation waits for the open. A restart retains cached
-history and revalidates the complete previous session for corrections.
+and downloads the preceding regular session's genuine completed daily candle plus
+its five-minute history, repairing gaps when possible. Preparation stores these
+separately in the existing journal and creates no signals or entries. It reports
+`ready` only when both daily candles and complete five-minute history are available
+for every symbol. Incomplete history, missing daily candles, and connection failures
+retry while account reconciliation continues; successful preparation waits for the
+open. A restart retains cached history and refreshes it for corrections.
 `paper_phase`, `paper_universe_ready`, and `paper_preparation` events show progress.
 
 At the **exchange open, normally 09:30 ET**, Alpaca's market-open flag enables scans;
 the scanner independently checks the exchange calendar and consumes only completed
 regular-session candles. New entries recheck the broker clock. A late startup or
-unfinished preparation catches up through the normal scanner, retaining freshness,
-missing-data, and revision checks. Broker reconciliation runs every five seconds
-and scans follow their configured cadence.
+unfinished preparation catches up through the normal scanner without waiting for
+preparation to become ready. PDH/PDL come exclusively from the matching previous
+regular session's daily candle. Missing previous-session five-minute history is
+diagnostic and may delay causal pivot confirmation, but does not block daily levels.
+`daily_bars_fetched` and `missing_daily_symbols` show daily availability;
+`previous_session_complete`, `previous_session_bars`, and
+`previous_session_expected_bars` report five-minute coverage in session and signal
+records. Current-session missing opening bars or internal gaps, unavailable daily
+levels, and freshness checks still block setups.
+Broker reconciliation runs every five seconds and scans follow their configured
+cadence. Each scan refreshes its intraday cutoff after downloading daily candles,
+so a five-minute candle completed during that download can be processed in the same
+scan. Freshness is checked after data retrieval and reconstruction and again before
+paper submission; the default maximum confirmation age is 90 seconds.
 
 End-of-day closing begins one minute before the exchange close, normally **15:59
 ET**, or **12:59 ET** on a 13:00 early close. Scans stop at the close; reconciliation
