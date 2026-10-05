@@ -283,6 +283,91 @@ def test_unprotected_position_is_flattened_with_confirmed_cancel(setup):
     assert client.submitted[-1]["qty"] == "20"
 
 
+@pytest.mark.parametrize("short", [False, True])
+@pytest.mark.parametrize("filled", [0, 7])
+def test_triggered_stop_survives_canceled_target_and_reconciles_fill(setup, short, filled):
+    broker, client, journal = setup
+    config = replace(AppConfig(), execution=ExecutionConfig(allow_shorts=True))
+    broker = AlpacaPaperBroker(client, config, journal)
+    broker.submit(signal(short=short), NOW)
+    client.fill_entry()
+    stop, target = client.orders["order-1"]["legs"]
+    target["status"] = "canceled"
+    stop.update(status="partially_filled" if filled else "new", filled_qty=str(filled))
+    client.position("AAPL", (20 - filled) * (-1 if short else 1))
+
+    # Alpaca cancels the target when its held stop is submitted for execution.
+    # The working stop must survive ordinary sync, expiry, invalidation, and restart.
+    assert broker.sync(NOW)["blocked"] == []
+    restarted = AlpacaPaperBroker(client, config, journal)
+    assert restarted.invalidate_pending(set(), NOW + timedelta(minutes=30))["blocked"] == []
+    assert client.canceled == []
+    assert len(client.submitted) == 1
+    assert "close_reason" not in next(iter(restarted.state["intents"].values()))
+
+    stop.update(status="filled", filled_qty="20")
+    client.position("AAPL", 0)
+    assert restarted.sync(NOW + timedelta(minutes=31))["managed_symbols"] == []
+    assert next(iter(restarted.state["intents"].values()))["state"] == "completed"
+    assert len(client.submitted) == 1
+
+
+@pytest.mark.parametrize(
+    "stop_changes,target_changes",
+    [
+        ({"status": "held"}, {}),
+        ({"status": "accepted"}, {}),
+        ({"status": "pending_new"}, {}),
+        ({"status": "pending_cancel"}, {}),
+        ({"status": "canceled"}, {}),
+        ({"status": "rejected"}, {}),
+        ({"qty": "19"}, {}),
+        ({"filled_qty": "7", "qty": "19"}, {}),
+        ({"side": "buy"}, {}),
+        ({"stop_price": "98"}, {}),
+        ({"type": "stop_limit"}, {}),
+        ({}, {"status": "rejected"}),
+        ({}, {"limit_price": "102"}),
+        ({}, {"side": "buy"}),
+    ],
+)
+def test_canceled_target_still_requires_working_matching_stop(setup, stop_changes, target_changes):
+    broker, client, _ = setup
+    broker.submit(signal(), NOW)
+    client.fill_entry()
+    stop, target = client.orders["order-1"]["legs"]
+    target["status"] = "canceled"
+    target.update(target_changes)
+    stop.update(status="new")
+    stop.update(stop_changes)
+    remaining = 20 - int(stop["filled_qty"])
+    client.position("AAPL", remaining)
+
+    broker.sync(NOW)
+
+    assert next(iter(broker.state["intents"].values()))["close_reason"] == "unprotected_position"
+    assert client.submitted[-1]["type"] == "market"
+    assert client.submitted[-1]["qty"] == str(remaining)
+
+
+@pytest.mark.parametrize("halt", [False, True])
+def test_triggered_stop_does_not_bypass_session_or_loss_closing(setup, halt):
+    broker, client, _ = setup
+    broker.submit(signal(), NOW)
+    client.fill_entry()
+    stop, target = client.orders["order-1"]["legs"]
+    target["status"] = "canceled"
+    stop["status"] = "new"
+    if halt:
+        client.account["equity"] = "9890"
+
+    broker.sync(NOW if halt else NOW.replace(hour=19, minute=59, second=30))
+
+    assert "order-1-stop" in client.canceled
+    assert client.submitted[-1]["type"] == "market"
+    assert client.submitted[-1]["qty"] == "20"
+
+
 def test_ownership_mismatch_blocks_without_touching_exits(setup):
     broker, client, _ = setup
     broker.submit(signal(), NOW)

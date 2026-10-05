@@ -79,6 +79,8 @@ uv run --no-sync alpaca-dashboard
 
 Use `uv run --no-sync` after installing these integrations. A plain `uv sync` removes packages outside the core lockfile; to retain them while syncing development dependencies, use `uv sync --locked --inexact --group dev`. Each integration manages its own dependencies and license.
 
+The dashboard's **Strategy analysis** tab includes win rate, Sharpe, CAGR, max drawdown, and other account-wide metrics for the selected timeframe. To pick up dashboard updates, update its source checkout, rerun the editable install, and restart the dashboard. See the [dashboard guide](docs/paper-trading.md#trade-history-dashboard) for scope and data requirements.
+
 `paper` continues until interrupted. **`paper --once` leaves accepted brackets at Alpaca** and does not provide ongoing expiry or end-of-day management. Keep `data/alpaca-paper.sqlite` across restarts so orders and fills remain attributable to this strategy. Read the [paper trading guide](docs/paper-trading.md) before operating a paper account.
 
 ## Documentation

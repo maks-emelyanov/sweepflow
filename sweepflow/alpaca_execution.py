@@ -186,12 +186,27 @@ class AlpacaPaperBroker:
             and _qty(leg, "qty") - _qty(leg) >= qty
         ]
         stop, target = decimal(intent["signal"]["stop"]), decimal(intent["signal"]["target"])
-        return any(
-            leg.get("type") == "stop" and decimal(leg.get("stop_price") or 0) == stop
+        stops = [
+            leg
             for leg in legs
-        ) and any(
+            if leg.get("type") == "stop" and decimal(leg.get("stop_price") or 0) == stop
+        ]
+        if not stops:
+            return False
+        if any(
             leg.get("type") == "limit" and decimal(leg.get("limit_price") or 0) == target
             for leg in legs
+        ):
+            return True
+        # Alpaca cancels the target when a held stop triggers and becomes new
+        # (then possibly partially_filled). Keep that working exit in place;
+        # a held stop alone is not evidence that this transition happened.
+        return any(leg.get("status") in {"new", "partially_filled"} for leg in stops) and any(
+            leg.get("status") == "canceled"
+            and leg.get("side") == side
+            and leg.get("type") == "limit"
+            and decimal(leg.get("limit_price") or 0) == target
+            for leg in order.get("legs") or []
         )
 
     def _cancel(self, order: dict) -> None:
