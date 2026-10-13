@@ -61,10 +61,11 @@ The Robinhood wrapper and Alpaca dashboard are independent projects. Their sourc
 SweepFlow expects the wrapper's `robinhood_mcp_wrapper` Python package and `robinhood-mcp-wrapper` command. When upgrading an existing wrapper checkout, rerun the editable install below to refresh its package metadata and console command.
 
 ```bash
-# Needed for discover/fetch/scan/watch and paper market data.
+# Needed for discover/feed-check/fetch/scan/watch and paper market data.
 uv pip install --python .venv/bin/python --editable /absolute/path/to/robinhood
 uv run --no-sync robinhood-mcp-wrapper auth login
 uv run --no-sync sweepflow discover
+uv run --no-sync sweepflow feed-check
 
 # One read-only scan of a small universe.
 uv run --no-sync sweepflow scan --symbols AAPL MSFT --db data/shadow.sqlite
@@ -78,6 +79,8 @@ uv run --no-sync alpaca-dashboard
 ```
 
 Use `uv run --no-sync` after installing these integrations. A plain `uv sync` removes packages outside the core lockfile; to retain them while syncing development dependencies, use `uv sync --locked --inexact --group dev`. Each integration manages its own dependencies and license.
+
+`feed-check` verifies actual Robinhood access to one completed historical SPY candle; stored credentials alone do not establish working access. It prints JSON and exits successfully only for `status="ready"`. Current-session freshness and universe coverage are checked separately by scanning. See [Feed health](docs/usage.md#feed-health) for failures and reauthorization.
 
 The dashboard's **Strategy analysis** tab includes win rate, Sharpe, CAGR, max drawdown, and other account-wide metrics for the selected timeframe. To pick up dashboard updates, update its source checkout, rerun the editable install, and restart the dashboard. See the [dashboard guide](docs/paper-trading.md#trade-history-dashboard) for scope and data requirements.
 

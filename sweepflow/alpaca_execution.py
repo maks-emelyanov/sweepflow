@@ -209,6 +209,39 @@ class AlpacaPaperBroker:
             for leg in order.get("legs") or []
         )
 
+    def _record_protection(self, intent: dict, now: datetime, stage: str) -> bool:
+        """Record only protection diagnostics, never the complete broker response."""
+        order = intent.get("order") or {}
+        fields = (
+            "status",
+            "type",
+            "side",
+            "qty",
+            "filled_qty",
+            "stop_price",
+            "limit_price",
+            "submitted_at",
+            "updated_at",
+            "canceled_at",
+            "filled_at",
+        )
+        protected = self._protects(intent)
+        self._event(
+            "protection_check",
+            symbol=intent["payload"]["symbol"],
+            signal_id=intent["signal"]["id"],
+            at=now.isoformat(),
+            stage=stage,
+            protected=protected,
+            remaining_quantity=str(self._remaining(intent)),
+            order={key: order[key] for key in fields if order.get(key) is not None},
+            legs=[
+                {key: leg[key] for key in fields if leg.get(key) is not None}
+                for leg in order.get("legs") or []
+            ],
+        )
+        return protected
+
     def _cancel(self, order: dict) -> None:
         if order.get("status") in TERMINAL:
             return
@@ -240,6 +273,23 @@ class AlpacaPaperBroker:
             if c.get("state") != "rejected"
         ):
             return
+        if intent.get("close_reason") == "unprotected_position":
+            # A canceled target can appear before its triggered stop becomes
+            # working. Confirm the current broker state before canceling exits;
+            # never treat a still-held stop alone as restored protection.
+            self._record_protection(intent, now, "before_refresh")
+            self._lookup(intent)
+            self._save()
+            if intent.get("state") in {"unknown", "rejected", "completed"}:
+                return
+            if self._record_protection(intent, now, "after_refresh"):
+                del intent["close_reason"]
+                self._save()
+                return
+            # The confirming read may include additional fills. Refresh the
+            # ownership inputs before applying the usual cancellation checks.
+            self.positions = {p["symbol"]: p for p in self.client.get_positions()}
+            self.open_orders = self.client.get_open_orders()
         order = intent.get("order") or {}
         if order.get("status") not in TERMINAL:
             # This is our entry remainder even if someone else acquired the
@@ -347,7 +397,9 @@ class AlpacaPaperBroker:
             elif remaining < 0:
                 intent["close_reason"] = "overfilled_exit"
             elif remaining > 0 and not self._protects(intent):
-                intent["close_reason"] = "unprotected_position"
+                # A transient protection gap must not replace an earlier close
+                # decision: an entry can finish filling while cancel is pending.
+                intent["close_reason"] = intent.get("close_reason") or "unprotected_position"
             elif (
                 now >= _time(intent["signal"]["expires_at"]) and order.get("status") not in TERMINAL
             ):

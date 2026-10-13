@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -312,6 +313,185 @@ def test_triggered_stop_survives_canceled_target_and_reconciles_fill(setup, shor
     assert len(client.submitted) == 1
 
 
+@pytest.mark.parametrize("short", [False, True])
+@pytest.mark.parametrize("filled_on_recheck", [0, 7])
+def test_triggered_stop_transition_is_rechecked_before_cancel(
+    setup, monkeypatch, short, filled_on_recheck
+):
+    _, client, journal = setup
+    config = replace(AppConfig(), execution=ExecutionConfig(allow_shorts=True))
+    broker = AlpacaPaperBroker(client, config, journal)
+    broker.submit(signal(short=short), NOW)
+    client.fill_entry()
+    order = client.orders["order-1"]
+    stop, target = order["legs"]
+    target.update(status="canceled", canceled_at=NOW.isoformat())
+    order["account_id"] = "not-for-protection-audit"
+    stop["raw_response"] = "not-for-protection-audit"
+    original_get_order = client.get_order
+    reads = 0
+
+    def get_order(identity):
+        nonlocal reads
+        snapshot = original_get_order(identity)
+        reads += 1
+        if reads == 1:
+            # The first snapshot still shows a held stop after target cancel.
+            # The broker activates it before the confirming read.
+            stop.update(
+                status="partially_filled" if filled_on_recheck else "new",
+                filled_qty=str(filled_on_recheck),
+                submitted_at=(NOW + timedelta(seconds=1)).isoformat(),
+                updated_at=(NOW + timedelta(seconds=2)).isoformat(),
+            )
+            client.position("AAPL", (20 - filled_on_recheck) * (-1 if short else 1))
+        return snapshot
+
+    monkeypatch.setattr(client, "get_order", get_order)
+    assert broker.sync(NOW)["blocked"] == []
+    assert reads == 2
+    assert client.canceled == []
+    assert len(client.submitted) == 1
+    persisted = journal.get_alpaca_state("paper-account")
+    assert "close_reason" not in next(iter(persisted["intents"].values()))
+    diagnostics = [
+        json.loads(row[0])
+        for row in journal.connection.execute(
+            "SELECT payload FROM decisions WHERE kind='protection_check' ORDER BY id"
+        )
+    ]
+    assert [event["stage"] for event in diagnostics] == ["before_refresh", "after_refresh"]
+    assert [event["protected"] for event in diagnostics] == [False, True]
+    assert diagnostics[0]["legs"][0]["status"] == "held"
+    assert diagnostics[1]["legs"][0]["submitted_at"] == stop["submitted_at"]
+    assert diagnostics[1]["legs"][0]["updated_at"] == stop["updated_at"]
+    assert diagnostics[1]["legs"][1]["canceled_at"] == target["canceled_at"]
+    assert diagnostics[1]["remaining_quantity"] == str(20 - filled_on_recheck)
+    assert "not-for-protection-audit" not in json.dumps(diagnostics)
+
+    # The surviving stop may then partially fill and finish normally.
+    stop.update(status="partially_filled", filled_qty="7")
+    client.position("AAPL", 13 * (-1 if short else 1))
+    assert broker.sync(NOW + timedelta(seconds=5))["blocked"] == []
+    stop.update(status="filled", filled_qty="20")
+    client.position("AAPL", 0)
+    assert broker.sync(NOW + timedelta(seconds=10))["managed_symbols"] == []
+    assert client.canceled == []
+    assert len(client.submitted) == 1
+
+
+def test_restored_protection_clears_persisted_close_reason_after_restart(setup):
+    broker, client, journal = setup
+    broker.submit(signal(), NOW)
+    client.fill_entry()
+    stop, target = client.orders["order-1"]["legs"]
+    stop["status"], target["status"] = "new", "canceled"
+    intent = next(iter(broker.state["intents"].values()))
+    intent["close_reason"] = "unprotected_position"
+    broker._save()
+
+    restarted = AlpacaPaperBroker(client, AppConfig(), journal)
+    assert restarted.sync(NOW)["blocked"] == []
+    assert "close_reason" not in next(iter(restarted.state["intents"].values()))
+    assert "close_reason" not in next(
+        iter(journal.get_alpaca_state("paper-account")["intents"].values())
+    )
+    assert client.canceled == []
+    assert len(client.submitted) == 1
+
+
+@pytest.mark.parametrize("reason", ["partial_entry", "daily_loss_limit", "session_end"])
+def test_protection_recovery_does_not_clear_mandatory_close_reason(setup, reason):
+    broker, client, _ = setup
+    broker.submit(signal(), NOW)
+    client.fill_entry(qty=7 if reason == "partial_entry" else None)
+    stop, target = client.orders["order-1"]["legs"]
+    stop["status"], target["status"] = "new", "canceled"
+    intent = next(iter(broker.state["intents"].values()))
+    intent["close_reason"] = "unprotected_position"
+    if reason == "daily_loss_limit":
+        client.account["equity"] = "9890"
+
+    broker.sync(NOW.replace(hour=19, minute=59, second=30) if reason == "session_end" else NOW)
+
+    assert intent["close_reason"] == reason
+    assert ("order-1" if reason == "partial_entry" else "order-1-stop") in client.canceled
+    assert client.submitted[-1]["type"] == "market"
+    assert client.submitted[-1]["qty"] == ("7" if reason == "partial_entry" else "20")
+
+
+@pytest.mark.parametrize("short", [False, True])
+@pytest.mark.parametrize("reason", ["partial_entry", "entry_expired", "signal_invalidated"])
+def test_cancel_pending_entry_fill_preserves_close_reason_when_stop_recovers(
+    setup, monkeypatch, short, reason
+):
+    _, client, journal = setup
+    config = replace(AppConfig(), execution=ExecutionConfig(allow_shorts=True))
+    broker = AlpacaPaperBroker(client, config, journal)
+    broker.submit(signal(short=short), NOW)
+    if reason == "partial_entry":
+        client.fill_entry(7)
+    client.cancel_ack = False
+    at = NOW + timedelta(minutes=21) if reason == "entry_expired" else NOW
+    if reason == "signal_invalidated":
+        broker.invalidate_pending(set(), at)
+    else:
+        broker.sync(at)
+    intent = next(iter(broker.state["intents"].values()))
+    assert intent["close_reason"] == reason
+    assert intent["order"]["status"] == "pending_cancel"
+
+    # Cancellation races with the remaining entry fill. Its activated stop
+    # must not erase the durable decision to close the resulting exposure.
+    client.fill_entry()
+    stop, target = client.orders["order-1"]["legs"]
+    stop["status"] = "held"
+    target["status"] = "canceled"
+    original_get_order = client.get_order
+    reads = 0
+
+    def get_order(identity):
+        nonlocal reads
+        snapshot = original_get_order(identity)
+        reads += 1
+        if reads == 1:
+            stop["status"] = "new"
+        return snapshot
+
+    monkeypatch.setattr(client, "get_order", get_order)
+    client.cancel_ack = True
+    # Reload the intent to prove the earlier decision also survives restart.
+    restarted = AlpacaPaperBroker(client, config, journal)
+    result = restarted.sync(at + timedelta(seconds=1))
+    persisted = next(iter(journal.get_alpaca_state("paper-account")["intents"].values()))
+    assert persisted["close_reason"] == reason
+    assert "closing:AAPL" in result["blocked"]
+    assert "order-1-stop" in client.canceled
+    assert len(client.submitted) == 2
+    assert client.submitted[-1]["type"] == "market"
+    assert client.submitted[-1]["qty"] == "20"
+    assert client.submitted[-1]["side"] == ("buy" if short else "sell")
+
+
+def test_unknown_protection_recheck_does_not_cancel_exits(setup, monkeypatch):
+    broker, client, _ = setup
+    broker.submit(signal(), NOW)
+    client.fill_entry()
+    client.orders["order-1"]["legs"][1]["status"] = "canceled"
+    original_get_order = client.get_order
+    reads = 0
+
+    def get_order(identity):
+        nonlocal reads
+        reads += 1
+        return original_get_order(identity) if reads == 1 else None
+
+    monkeypatch.setattr(client, "get_order", get_order)
+    assert "unknown_submission:AAPL" in broker.sync(NOW)["blocked"]
+    assert client.canceled == []
+    assert len(client.submitted) == 1
+
+
 @pytest.mark.parametrize(
     "stop_changes,target_changes",
     [
@@ -348,6 +528,14 @@ def test_canceled_target_still_requires_working_matching_stop(setup, stop_change
     assert next(iter(broker.state["intents"].values()))["close_reason"] == "unprotected_position"
     assert client.submitted[-1]["type"] == "market"
     assert client.submitted[-1]["qty"] == str(remaining)
+    diagnostics = [
+        json.loads(row[0])
+        for row in broker.journal.connection.execute(
+            "SELECT payload FROM decisions WHERE kind='protection_check' ORDER BY id"
+        )
+    ]
+    assert [event["stage"] for event in diagnostics] == ["before_refresh", "after_refresh"]
+    assert not any(event["protected"] for event in diagnostics)
 
 
 @pytest.mark.parametrize("halt", [False, True])

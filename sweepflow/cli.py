@@ -43,6 +43,10 @@ def parser() -> argparse.ArgumentParser:
     )
     commands = app.add_subparsers(dest="command", required=True)
     commands.add_parser("discover", help="Read current Robinhood MCP capabilities; does not trade")
+    commands.add_parser(
+        "feed-check",
+        help="Probe Robinhood authorization and historical candle access; does not trade",
+    )
     universe = commands.add_parser("universe", help="Download dated S&P 500 constituents")
     universe.add_argument("--output", type=Path, default=Path("data/sp500.json"))
     for name, help_text in (
@@ -312,6 +316,12 @@ def main(argv: list[str] | None = None) -> int:
             alpaca_command(args, config)
         elif args.command in {"replay", "signals"}:
             offline_command(args, config)
+        elif args.command == "feed-check":
+            from sweepflow.health import check_feed
+
+            result = asyncio.run(check_feed())
+            print(dumps(result))
+            return 0 if result["status"] == "ready" else 1
         else:
             asyncio.run(network_command(args, config))
         return 0

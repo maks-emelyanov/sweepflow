@@ -12,7 +12,7 @@ from sweepflow.cli import parser
 from sweepflow.config import AppConfig
 from sweepflow.models import Signal
 from sweepflow.monitor import ScanResult, bind_monitor, scan
-from sweepflow.paper import paper_account_lock, run_paper
+from sweepflow.paper import feed_error_fields, paper_account_lock, run_paper
 from sweepflow.storage import Journal
 
 
@@ -685,3 +685,182 @@ def test_broker_retry_deferrals_wait_without_spending_sync_error_budget():
                 await asyncio.gather(task, return_exceptions=True)
 
     asyncio.run(test())
+
+
+class AuthenticationRequired(RuntimeError):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("error_class", "reason"),
+    [(AuthenticationRequired, "authentication_required"), (RuntimeError, "feed_unavailable")],
+)
+def test_once_feed_failure_exits_with_sanitized_action(monkeypatch, capsys, error_class, reason):
+    from sweepflow import cli
+
+    broker = Broker()
+    emitted, persisted = [], []
+    _, _, session = scenario()
+
+    async def failed(*args, **kwargs):
+        raise error_class("unsafe credential marker")
+
+    def fake_alpaca_command(args, config):
+        with Journal(":memory:") as journal:
+            try:
+                asyncio.run(
+                    run_paper(
+                        broker,
+                        args.symbols,
+                        config,
+                        journal,
+                        once=args.once,
+                        source_factory=SourceContext,
+                        poll_seconds=0.001,
+                        clock=lambda: session.open + timedelta(minutes=30),
+                        emit=emitted.append,
+                    )
+                )
+            finally:
+                persisted.extend(journal.events())
+
+    monkeypatch.setattr("sweepflow.paper.scan", failed)
+    monkeypatch.setattr(cli, "alpaca_command", fake_alpaca_command)
+    assert cli.main(["paper", "--once", "--symbols", "AAPL"]) == 1
+    output = capsys.readouterr()
+    assert reason in output.err
+    assert "automatic" not in output.err
+    if reason == "authentication_required":
+        assert "robinhood-mcp-wrapper auth login" in output.err
+    assert "unsafe credential marker" not in output.out + output.err + repr(emitted + persisted)
+    assert broker.invalidations and all(item == set() for item in broker.invalidations)
+    assert broker.submissions == []
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_feed_authentication_details_are_actionable_and_sanitized(wrapped):
+    error = AuthenticationRequired("secret token and unsafe upstream response")
+    if wrapped:
+        error = ExceptionGroup("sensitive group message", [error])
+    fields = feed_error_fields(error)
+    assert fields["reason"] == "authentication_required"
+    assert "robinhood-mcp-wrapper auth login" in fields["action"]
+    assert "secret" not in repr(fields)
+    assert "sensitive" not in repr(fields)
+    assert feed_error_fields(RuntimeError("secret"))["reason"] == "feed_unavailable"
+
+
+@pytest.mark.parametrize("chaining", ["implicit", "explicit", "suppressed", "other_cause"])
+def test_feed_authentication_follows_visible_exception_chain(chaining):
+    try:
+        try:
+            raise AuthenticationRequired("credential detail")
+        except AuthenticationRequired as cause:
+            if chaining == "explicit":
+                raise RuntimeError("transport detail") from cause
+            if chaining == "suppressed":
+                raise RuntimeError("transport detail") from None
+            if chaining == "other_cause":
+                raise RuntimeError("transport detail") from ValueError("another cause")
+            raise RuntimeError("transport detail")  # noqa: B904 - exercise implicit chaining
+    except RuntimeError as error:
+        fields = feed_error_fields(error)
+    expected = (
+        "authentication_required" if chaining in {"implicit", "explicit"} else "feed_unavailable"
+    )
+    assert fields["reason"] == expected
+    assert "detail" not in repr(fields)
+
+
+def test_feed_error_classification_tolerates_context_cycles():
+    first, second = RuntimeError("first"), RuntimeError("second")
+    first.__context__, second.__context__ = second, first
+    assert feed_error_fields(first)["reason"] == "feed_unavailable"
+
+
+async def wait_for_paper_condition(predicate):
+    async def wait():
+        while not predicate():
+            await asyncio.sleep(0.001)
+
+    await asyncio.wait_for(wait(), timeout=2)
+
+
+def test_authentication_backoff_is_bounded_keeps_syncing_and_resets_after_recovery(monkeypatch):
+    async def check():
+        elapsed = 0.0
+        _, config, session = scenario()
+        wall_start = session.open + timedelta(minutes=30)
+        starts = []
+        emitted = []
+        broker = Broker()
+
+        async def fake_scan(*args, **kwargs):
+            starts.append(elapsed)
+            if len(starts) != 7:
+                raise AuthenticationRequired("unsafe-token")
+            return ScanResult("ok", 1, 0, ())
+
+        monkeypatch.setattr("sweepflow.paper.scan", fake_scan)
+        with Journal(":memory:") as journal:
+            task = asyncio.create_task(
+                run_paper(
+                    broker,
+                    ["AAPL"],
+                    config,
+                    journal,
+                    poll_seconds=0.001,
+                    scan_seconds=30,
+                    max_errors=1,
+                    source_factory=SourceContext,
+                    clock=lambda: wall_start + timedelta(seconds=elapsed),
+                    monotonic=lambda: elapsed,
+                    emit=emitted.append,
+                )
+            )
+            try:
+                for count, delay in enumerate([60, 120, 240, 480, 900, 900], start=1):
+                    await wait_for_paper_condition(
+                        lambda count=count: (
+                            sum(e["event"] == "paper_feed_error" for e in emitted) == count
+                        )
+                    )
+                    health = [e for e in emitted if e["event"] == "paper_feed_health"][-1]
+                    assert health["reason"] == "authentication_required"
+                    assert health["retry_after_seconds"] == delay
+                    assert health["consecutive"] == count
+                    assert health["outage_seconds"] == elapsed
+                    assert health["next_retry_at"] == wall_start + timedelta(
+                        seconds=elapsed + delay
+                    )
+                    assert health["entries_paused"] is True
+                    syncs = broker.calls
+                    elapsed += delay - 1
+                    await wait_for_paper_condition(lambda syncs=syncs: broker.calls >= syncs + 2)
+                    assert len(starts) == count
+                    assert not task.done()
+                    assert broker.submissions == []
+                    elapsed += 1
+                await wait_for_paper_condition(
+                    lambda: any(e["event"] == "paper_scan" for e in emitted)
+                )
+                recovered = [e for e in emitted if e["event"] == "paper_feed_health"][-1]
+                assert recovered["status"] == "recovered"
+                assert recovered["errors"] == 6
+                assert recovered["outage_seconds"] == 2700
+                assert broker.invalidations and all(i == set() for i in broker.invalidations)
+                elapsed += 30
+                await wait_for_paper_condition(
+                    lambda: sum(e["event"] == "paper_feed_error" for e in emitted) == 7
+                )
+                restarted = [e for e in emitted if e["event"] == "paper_feed_health"][-1]
+                assert restarted["retry_after_seconds"] == 60
+                assert restarted["consecutive"] == 1
+                assert restarted["outage_seconds"] == 0
+                assert "unsafe-token" not in repr(emitted)
+                assert "unsafe-token" not in repr(journal.events())
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(check())

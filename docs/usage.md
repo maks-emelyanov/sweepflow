@@ -9,6 +9,7 @@ Install the core and optional Robinhood wrapper as described in [the README](../
 | `audit` | Export journal events as JSON lines | No |
 | `universe` | Download dated SPY holdings | Network; no broker credentials |
 | `discover` | Inspect read-only Robinhood capabilities | Wrapper and Robinhood OAuth |
+| `feed-check` | Verify authorization and one previous-session SPY candle | Wrapper and Robinhood OAuth |
 | `fetch` | Export Robinhood candles to CSV | Wrapper and Robinhood OAuth |
 | `scan` / `watch` | Journal one scan / poll for signals | Wrapper and Robinhood OAuth |
 | `alpaca-sync` | Reconcile the Alpaca paper account | Alpaca paper credentials; POSIX |
@@ -41,6 +42,27 @@ uv run --no-sync sweepflow watch --symbols AAPL MSFT --db data/two-symbols.sqlit
 Without a symbol override, monitoring downloads State Street's official daily SPY holdings and saves `data/sp500.json`. State Street currently delivers this download as XLSX; the loader reads its embedded holdings date and ticker column directly without an Excel dependency. Cash and non-equity corporate-action rows are excluded. Share classes mean the list need not contain exactly 500 symbols. `--etfs` selects SPY, VOO, and IVV. Explicit JSON snapshots, text lists, and CSV files with a `symbol` or `ticker` column are accepted. Use dated membership lists for historical studies; today's holdings introduce survivorship bias. Source: [State Street SPY](https://www.ssga.com/us/en/individual/etfs/state-street-spdr-sp-500-etf-trust-spy).
 
 Global `--config` goes **before** the subcommand. Settings are strictly validated; misspelled keys fail. All prices and account-risk arithmetic use `Decimal`.
+
+## Feed health
+
+Use the read-only probe before starting a paper session or after reauthorizing Robinhood:
+
+```bash
+uv run --no-sync sweepflow feed-check
+```
+
+The probe connects, discovers historical-data support, and requests SPY's final five-minute candle from the regular exchange session before today's New York date. A valid result requires one completed, non-interpolated candle at the exact requested interval with positive volume. Older, duplicate, or zero-volume candles do not establish readiness. The request has a 30-second budget, followed by up to five seconds for connection cleanup; no orders or journal writes are made.
+
+Output is JSON. `status="ready"` exits with code 0; `incomplete` means the required candle was not validated, and `unavailable` means the connection, authorization, capability discovery, or request failed. Both exit with code 1 and provide a sanitized reason and suggested action. `coverage_scope="previous_session_close"` and `real_time_verified=false` limit the result to historical access: scanning still checks current-session freshness and symbol coverage.
+
+Stored-credential status is not a network access check. For `reason="authentication_required"`, reauthorize through the wrapper and repeat the probe:
+
+```bash
+uv run --no-sync robinhood-mcp-wrapper auth login --force
+uv run --no-sync sweepflow feed-check
+```
+
+The continuous paper runner retries authentication failures with a bounded backoff while Alpaca reconciliation continues. It does not launch an interactive login. See [Scheduled operations](operations.md#inspect-and-stop) for health events and retry behavior.
 
 ## Data and execution
 

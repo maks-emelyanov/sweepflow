@@ -19,6 +19,35 @@ from sweepflow.sessions import NEW_YORK, SessionCalendar
 from sweepflow.storage import Journal, dumps
 
 
+def feed_error_fields(exc: Exception) -> dict[str, str]:
+    """Classify feed failures without optional imports or upstream error text."""
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while pending:
+        error = pending.pop()
+        if id(error) in seen:
+            continue
+        seen.add(id(error))
+        if any(cls.__name__ == "AuthenticationRequired" for cls in type(error).__mro__):
+            return {
+                "reason": "authentication_required",
+                "action": (
+                    "Reauthenticate Robinhood with `uv run --no-sync "
+                    "robinhood-mcp-wrapper auth login --force`."
+                ),
+            }
+        if isinstance(error, BaseExceptionGroup):
+            pending.extend(error.exceptions)
+        if error.__cause__ is not None:
+            pending.append(error.__cause__)
+        elif error.__context__ is not None and not error.__suppress_context__:
+            pending.append(error.__context__)
+    return {
+        "reason": "feed_unavailable",
+        "action": "Check the Robinhood data connection and service availability.",
+    }
+
+
 @contextmanager
 def paper_account_lock(account_id: str) -> Iterator[None]:
     """One runner per OS user/account, even when different journals are supplied."""
@@ -76,6 +105,12 @@ async def run_paper(
     last_feed_success = monotonic()
     entries_canceled_for_feed = False
     next_control_retry = 0.0
+    feed_retry_at = 0.0
+    auth_errors = 0
+    outage_started = None
+    outage_started_at = None
+    outage_errors = 0
+    outage_reason = None
 
     def error_fields(exc: Exception) -> dict[str, object]:
         # Upstream bodies and arbitrary exception text can echo credentials.
@@ -100,6 +135,61 @@ async def run_paper(
         payload = {"event": event, **fields}
         journal.record(payload)
         emit(payload)
+
+    def feed_failure(exc: Exception, stage: str) -> None:
+        nonlocal feed_retry_at, auth_errors, outage_started, outage_started_at
+        nonlocal outage_errors, outage_reason
+        at = monotonic()
+        if outage_started is None:
+            outage_started = at
+            outage_started_at = clock()
+        details = feed_error_fields(exc)
+        outage_reason = details["reason"]
+        outage_errors += 1
+        delay = max(scan_seconds, poll_seconds)
+        if outage_reason == "authentication_required":
+            auth_errors += 1
+            # Repeated authentication attempts cannot repair expired consent.
+            # Back off across both preparation and scans, including the open.
+            delay = min(900.0, max(delay, 60.0 * 2 ** min(auth_errors - 1, 4)))
+        else:
+            auth_errors = 0
+        feed_retry_at = at + delay
+        report(
+            "paper_feed_health",
+            status="unavailable",
+            stage=stage,
+            **(error_fields(exc) | details),
+            since=outage_started_at,
+            outage_seconds=max(0.0, at - outage_started),
+            consecutive=outage_errors,
+            retry_after_seconds=delay,
+            next_retry_at=clock() + timedelta(seconds=delay),
+            entries_paused=True,
+            broker_reconciliation_active=True,
+        )
+
+    def feed_recovered(stage: str) -> None:
+        nonlocal feed_retry_at, auth_errors, outage_started, outage_started_at
+        nonlocal outage_errors, outage_reason
+        if outage_started is not None:
+            report(
+                "paper_feed_health",
+                status="recovered",
+                stage=stage,
+                previous_reason=outage_reason,
+                since=outage_started_at,
+                outage_seconds=max(0.0, monotonic() - outage_started),
+                errors=outage_errors,
+                action="Feed requests succeeded; normal data validation and entry checks resume.",
+                broker_reconciliation_active=True,
+            )
+        feed_retry_at = 0.0
+        auth_errors = 0
+        outage_started = None
+        outage_started_at = None
+        outage_errors = 0
+        outage_reason = None
 
     async def read_history():
         # A stuck data connection must not occupy the preparation slot forever.
@@ -181,12 +271,29 @@ async def run_paper(
                     preparation = completed.result()
                 except Exception as exc:
                     preparation_errors += 1
+                    feed_failure(exc, "preparation")
                     report(
                         "paper_preparation_error",
                         **error_fields(exc),
                         consecutive=preparation_errors,
                     )
                 else:
+                    if preparation.status in {"ready", "incomplete"}:
+                        feed_recovered("preparation")
+                    if preparation.status == "incomplete":
+                        report(
+                            "paper_feed_health",
+                            status="degraded",
+                            stage="preparation",
+                            reason="incomplete_history",
+                            missing_intraday_symbols=preparation.missing_symbols,
+                            missing_daily_symbols=preparation.missing_daily_symbols,
+                            action=(
+                                "Retry previous-session history. Missing daily levels block "
+                                "entries for affected symbols; intraday gaps are diagnostic."
+                            ),
+                            broker_reconciliation_active=True,
+                        )
                     if preparation_errors:
                         report("paper_preparation_recovered", errors=preparation_errors)
                     preparation_errors = 0
@@ -200,6 +307,7 @@ async def run_paper(
                     result = completed.result()
                 except Exception as exc:
                     feed_errors += 1
+                    feed_failure(exc, "scan")
                     # A fast failed scan must not create an immediate retry loop.
                     next_scan = monotonic() + max(scan_seconds, poll_seconds)
                     # An unavailable strategy feed cannot justify resting entries.
@@ -215,14 +323,19 @@ async def run_paper(
                         entries_paused=True,
                     )
                     if once:
-                        raise
+                        details = feed_error_fields(exc)
+                        raise RuntimeError(
+                            f"Market-data feed unavailable ({details['reason']}). "
+                            f"{details['action']}"
+                        ) from None
                 else:
-                    if not snapshot.get("market_open"):
+                    if not snapshot.get("market_open") or result.status == "market_closed":
                         report("paper_scan_skipped", reason="market_closed")
                         if once:
                             finished_normally = True
                             return
                         continue
+                    feed_recovered("scan")
                     if feed_errors:
                         report("paper_feed_recovered", errors=feed_errors)
                     feed_errors = 0
@@ -260,7 +373,11 @@ async def run_paper(
                 snapshot.get("market_open")
                 and not entries_canceled_for_feed
                 and monotonic() >= next_control_retry
-                and (feed_errors or monotonic() - last_feed_success > 300 + max_signal_age)
+                and (
+                    feed_errors
+                    or outage_started is not None
+                    or monotonic() - last_feed_success > 300 + max_signal_age
+                )
             ):
                 try:
                     broker.invalidate_pending(set())
@@ -268,7 +385,11 @@ async def run_paper(
                 except Exception as exc:
                     control_error(exc)
 
-            if task is None and snapshot.get("market_open") and monotonic() >= next_scan:
+            if (
+                task is None
+                and snapshot.get("market_open")
+                and monotonic() >= max(next_scan, feed_retry_at)
+            ):
                 task_kind = "scan"
                 # Cadence measures scan starts. A slow full-universe read already
                 # consumed the interval and needs no additional post-scan delay.
@@ -280,7 +401,7 @@ async def run_paper(
                 and not snapshot.get("market_open")
                 and preopen
                 and prepared_day != session.label
-                and monotonic() >= next_prepare
+                and monotonic() >= max(next_prepare, feed_retry_at)
             ):
                 task_kind = "prepare"
                 report("paper_preparation_started", session=session.label)

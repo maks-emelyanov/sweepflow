@@ -5,7 +5,7 @@ systemd enabled. Complete the [installation and authentication steps](../README.
 first, including the Robinhood wrapper, the checkout's `.venv`, and Alpaca paper
 credentials in `.env`.
 
-The templates in `ops/systemd/` run the State Street → Robinhood → Alpaca paper
+The paper templates in `ops/systemd/` run the State Street → Robinhood → Alpaca paper
 workflow **30 minutes before the NYSE open** until **10 minutes after the close**.
 Normal hours are **09:00–16:10 America/New_York**. The exchange calendar skips
 weekends and holidays and ends at **13:10** on a 13:00 early close. New York time
@@ -21,8 +21,8 @@ cat data/systemd/sweepflow-paper.service
 systemd-analyze --user verify data/systemd/sweepflow-paper.service data/systemd/sweepflow-paper.timer
 ```
 
-The renderer only writes the two units to the supplied output directory. It does
-not install, enable, or start them. `--root /absolute/path/to/sweepflow` selects a
+The renderer writes a paper service and timer to the supplied output directory.
+It does not install, enable, or start them. `--root /absolute/path/to/sweepflow` selects a
 different checkout. Paths may contain spaces, `%`, and `$`; paths with quotes,
 backslashes, control characters, or leading/trailing whitespace are rejected.
 Generated units remain valid after changing the shell's working directory.
@@ -108,6 +108,36 @@ interruption cancels unfilled strategy entries and preserves filled positions'
 protective exits.
 
 ## Inspect and stop
+
+Check working data access before a session:
+
+```bash
+uv run --no-sync sweepflow feed-check
+```
+
+The probe makes read-only Robinhood requests and checks SPY's previous-session
+final five-minute candle. Its JSON result exits with code 0 only for `ready`, which
+requires a genuine completed candle with positive volume at the exact requested
+interval. `incomplete` and `unavailable` exit with code 1. Its
+`previous_session_close` coverage scope does not certify current-session freshness
+or the full universe. Stored-credential status alone cannot establish working
+authorization. If the probe reports
+`authentication_required`, complete
+`uv run --no-sync robinhood-mcp-wrapper auth login --force`
+in the same environment and repeat the check. See [Feed health](usage.md#feed-health)
+for the probe's limits.
+
+Preparation and runtime failures emit `paper_feed_health` with a sanitized reason,
+corrective action, outage duration, and retry time. With the default polling
+intervals, authentication retries wait 60, 120, 240, 480, then 900 seconds;
+subsequent waits remain capped at 900 seconds, including across market open.
+Broker reconciliation continues, while unavailable data prevents new entries
+and requests cancellation of unfilled strategy entries during market hours.
+After an outage, successful preparation or an open-session scan emits `recovered`
+and resets the cooldown. Incomplete preopen history emits `degraded`; successful
+access alone does not remove symbol-level coverage checks. These events are written
+to the journal and stdout/systemd logs; they do not send external notifications or
+launch interactive authentication.
 
 ```bash
 # Inspect the installed schedule and logs:

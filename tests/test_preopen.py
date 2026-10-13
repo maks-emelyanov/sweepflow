@@ -437,6 +437,13 @@ def test_paper_retries_incomplete_and_failed_preparation_without_trading(monkeyp
                 assert len(attempts) == 3
                 assert broker.submissions == []
                 assert broker.invalidations == []
+                health = [e for e in journal.events() if e["event"] == "paper_feed_health"]
+                assert [e["status"] for e in health] == ["degraded", "unavailable", "recovered"]
+                assert health[0]["reason"] == "incomplete_history"
+                assert health[0]["missing_intraday_symbols"] == ["AAPL"]
+                assert health[1]["stage"] == "preparation"
+                assert health[1]["reason"] == "feed_unavailable"
+                assert health[2]["errors"] == 1
             finally:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
@@ -536,6 +543,83 @@ def test_preparation_finishing_after_open_does_not_become_a_trading_scan(monkeyp
                 assert not any(
                     event.get("event") == "paper_execution_error" for event in journal.events()
                 )
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(check())
+
+
+def test_preopen_authentication_outage_carries_backoff_and_cancellation_into_open(monkeypatch):
+    async def check():
+        _, config, session = scenario()
+        elapsed = 0.0
+        broker = Broker()
+        source_starts = []
+        scans = []
+        emitted = []
+
+        class AuthenticationRequired(RuntimeError):
+            pass
+
+        class AuthenticationContext(SourceContext):
+            async def __aenter__(self):
+                source_starts.append(elapsed)
+                if len(source_starts) == 1:
+                    raise AuthenticationRequired("credential must never be logged")
+                return self
+
+        async def live_scan(*args, **kwargs):
+            scans.append(elapsed)
+            return ScanResult("ok", 1, 0, ())
+
+        monkeypatch.setattr("sweepflow.paper.scan", live_scan)
+        with Journal(":memory:") as journal:
+            task = asyncio.create_task(
+                run_paper(
+                    broker,
+                    ["AAPL"],
+                    config,
+                    journal,
+                    poll_seconds=0.001,
+                    scan_seconds=30,
+                    max_errors=1,
+                    source_factory=AuthenticationContext,
+                    clock=lambda: session.open + timedelta(seconds=elapsed - 30),
+                    monotonic=lambda: elapsed,
+                    emit=emitted.append,
+                )
+            )
+            try:
+                await wait_until(
+                    lambda: any(e["event"] == "paper_preparation_error" for e in emitted)
+                )
+                first_health = next(e for e in emitted if e["event"] == "paper_feed_health")
+                assert first_health["stage"] == "preparation"
+                assert first_health["retry_after_seconds"] == 60
+                assert broker.invalidations == []
+                elapsed = 35
+                broker.market_open = True
+                await wait_until(lambda: bool(broker.invalidations))
+                assert broker.invalidations == [set()]
+                syncs = broker.calls
+                elapsed = 59
+                await wait_until(lambda: broker.calls >= syncs + 2)
+                assert source_starts == [0]
+                assert scans == []
+                assert not task.done()
+                elapsed = 60
+                await wait_until(lambda: any(e["event"] == "paper_scan" for e in emitted))
+                assert source_starts == [0, 60]
+                assert scans == [60]
+                recovered = [e for e in emitted if e["event"] == "paper_feed_health"][-1]
+                assert recovered["stage"] == "scan"
+                assert recovered["status"] == "recovered"
+                assert recovered["outage_seconds"] == 60
+                assert recovered["errors"] == 1
+                assert broker.submissions == []
+                assert "credential must never be logged" not in repr(emitted)
+                assert "credential must never be logged" not in repr(journal.events())
             finally:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)

@@ -2,6 +2,8 @@
 
 Use a dedicated Alpaca **paper** account and a POSIX host (Linux/WSL is the supported operating setup). Install the optional Robinhood wrapper and authenticate as described in [the README](../README.md#optional-integrations) before running the continuous `paper` workflow. One-shot `alpaca-sync` does not need the Robinhood wrapper.
 
+Run `uv run --no-sync sweepflow feed-check` to verify Robinhood authorization and access to the previous session's closing SPY candle. This read-only check does not verify current-session freshness or full-universe coverage; see [Feed health](usage.md#feed-health) for its JSON results and reauthorization command.
+
 Paper scans use Robinhood's completed daily candle from the immediately preceding regular session for PDH/PDL. Previous-session five-minute gaps affect pivot context, while missing daily levels or current-session gaps block setups. Daily and intraday corrections rebuild affected symbols without resetting confirmation age. See [Usage and data](usage.md#data-and-execution) for coverage and revision fields.
 
 ## Alpaca paper account
@@ -38,15 +40,32 @@ The runner persists an intent before sending its deterministic client order ID. 
 
 When Alpaca triggers a bracket stop, it cancels the paired profit target, as described in [Alpaca's explanation of bracket stop activation](https://forum.alpaca.markets/t/some-bracket-orders-don-t-have-stop-loss/5797/2). After the entry is fully filled, the runner preserves a `stop` leg in `new` or `partially_filled` status when its side and stop price match the strategy, its unfilled quantity covers the remaining position, and the matching profit target is canceled. This lets the exit finish without a redundant cancel-and-close order, including after a restart. A canceled target paired with only a `held` stop still fails the protection check. Daily-loss and end-of-day closing continue to apply during a triggered exit.
 
+Before canceling exits for `unprotected_position`, the runner performs another
+order read and re-evaluates protection. A target cancellation can become visible
+before its stop becomes active. If protection is restored, only that stale close
+reason is cleared. A genuinely unprotected position still follows the normal
+ownership and cancellation checks. `protection_check` events record selected
+order/leg states, quantities, prices, and timestamps before and after the read;
+they do not contain complete broker responses. If the confirming read fails or
+leaves order state unknown, the runner leaves exits in place for subsequent
+reconciliation. Existing close decisions remain in force across a protection gap,
+including partial-entry, expired-entry, and signal-invalidation exits when an entry
+finishes filling while cancellation is pending. Daily-loss and session-end exits
+retain their existing precedence.
+
 Alpaca activates bracket exits only after the entry fills completely. A detected partial entry is canceled and its attributed exposure is flattened after cancellation is confirmed. Expired or strategy-invalidated unfilled entries are canceled. Before any managed position is flattened, the runner cancels its live bracket legs, confirms their terminal states, refetches the position, and verifies that the quantity matches this strategy's recorded fills. Conflicting/unowned exposure is reported and blocks entries; the runner does not liquidate other strategies' holdings. Unowned risk cannot be safely budgeted, so a dedicated paper account is the normal operating setup.
 
 Broker synchronization runs every five seconds by default, independently of asynchronous Robinhood scans. Scan starts are scheduled thirty seconds apart; a scan taking longer starts its successor after completion without adding another thirty-second delay. Failed scans retain a retry cooldown while broker management continues. Use `--poll-seconds` and `--scan-seconds` to adjust these intervals. The candles are five-minute bars, but revisions are applied on every scan, including between candle boundaries. Signals are checked against the 90-second freshness budget again before submission. Corrected candles rebuild the affected symbol immediately: unchanged setups remain eligible, invalidated unfilled entries are canceled, and changed entry/stop/target prices produce a replacement signal. Replacement requires confirmed cancellation of the old entry, zero prior fills, and the original confirmation still being fresh; corrections never reset signal age. Filled positions retain their existing protective exits, and corrected history cannot create another trade from an already-filled setup or reset the session's executed-setup limit. Stale trailing candles and feed failures still prevent new entries and cancel affected pending entries. Feed errors keep broker management running; `--max-errors` (default three) stops the runner after consecutive Alpaca synchronization failures.
+
+Robinhood authentication failures use exponential retry delays capped at fifteen minutes, including when a preopen failure continues into market hours. The runner reports sanitized `paper_feed_health` events with outage duration, the next retry, and an actionable reauthorization command; it keeps reconciling Alpaca orders and positions. Successful reads reset the authentication cooldown, while the usual coverage and freshness checks still apply. See [Scheduled operations](operations.md#inspect-and-stop) for the retry sequence and recovery events.
 
 Alpaca GET requests retry temporary transport failures, HTTP 429, and server errors up to three attempts within the original request timeout. Short backoffs respect `Retry-After`; longer server delays defer subsequent reads without using the runner's consecutive-error budget. Order submissions and cancellations are sent once and reconciled by durable broker/client IDs. Error events record sanitized HTTP status, operation, endpoint template, reason, and attempt count when available, followed by recovery events when management resumes. Credentials, upstream response bodies, and arbitrary exception text are excluded.
 
 The daily breaker uses actual marked account equity against the persisted prior-close baseline; once the configured loss is reached, managed entries are canceled and managed positions are closed. The breaker remains latched for the trading date. End-of-day closing starts **60 seconds before the exchange close** (`--eod-seconds`) so there is time to confirm cancellations and send market exits while the market is open. This is a best-effort polled process: network outages or asynchronous fills can prevent flatness before the close. GTC protective exits survive a process outage; subsequent synchronization resolves remaining exposure when the market reopens.
 
 `--once` leaves accepted paper brackets at Alpaca; run continuous `paper` for entry expiry, feed invalidation, daily-loss, and end-of-day management. An orderly interruption cancels unfilled strategy entries and preserves filled positions' protective exits. The paper account is a broker simulation, separate from the [offline minute-bar replay](strategy.md#replay-execution-and-model-limits).
+
+If its scan fails to read the market-data feed, `paper --once` exits with code 1 and reports a sanitized reason and recovery action. Upstream exception text is omitted. Rerun the command after resolving the feed issue; automatic feed retries apply to the continuous runner.
 
 ## Trade history dashboard
 
